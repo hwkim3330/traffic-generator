@@ -1,0 +1,26 @@
+# Compiled binaries
+traffic_gen
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test results
+test_results_*/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

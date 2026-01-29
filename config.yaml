@@ -1,0 +1,35 @@
+# Traffic Generator Configuration Example
+# Copy this file and modify for your setup
+
+# Network Settings
+interface: enp11s0
+dst_ip: 192.168.1.100
+dst_mac: "00:11:22:33:44:55"
+src_ip: 192.168.1.1
+src_port: 10000
+dst_port: 5001
+
+# Packet Settings
+packet_size: 1472     # bytes (max MTU without fragmentation)
+rate_mbps: 1000       # Target rate in Mbps (0 = line rate)
+duration: 60          # Duration in seconds (0 = infinite)
+
+# Performance Settings
+workers: 4            # Number of worker threads/streams
+batch_size: 1024      # Packets per batch (for C version)
+
+# QoS Settings (optional)
+vlan_id: null         # VLAN ID 1-4094 (null = no VLAN)
+vlan_priority: 0      # VLAN priority 0-7
+dscp: 0               # DSCP value 0-63
+
+# Traffic Pattern (for advanced version)
+pattern: constant     # constant, burst, ramp, sine, random
+burst_duration: 0.1   # seconds
+burst_interval: 1.0   # seconds
+ramp_start: 100       # Mbps
+ramp_end: 1000        # Mbps
+
+# Multi-flow Settings
+num_flows: 1
+flow_distribution: round-robin  # round-robin, random
