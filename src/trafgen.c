@@ -1,5 +1,5 @@
 /*
- * trafgen - High-Performance Traffic Generator v1.2.0
+ * trafgen - High-Performance Traffic Generator v1.2.1
  * Based on Mausezahn concepts, enhanced with modern Linux networking features
  *
  * Copyright (C) 2025
@@ -52,7 +52,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.2.0"
+#define VERSION "1.2.1"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
@@ -160,7 +160,8 @@ typedef struct {
     int duration;
     int num_workers;
     int batch_size;
-    unsigned int delay_us;
+    uint64_t delay_ns;    /* Inter-packet delay in nanoseconds */
+    int delay_per_packet; /* Apply delay per packet (vs per batch) */
 
     /* Traffic pattern */
     traffic_pattern_t pattern;
@@ -778,16 +779,44 @@ static void *worker_thread(void *arg) {
         /* Rate limiting */
         token_bucket_consume(ctx->bucket, batch_bytes);
 
-        /* Send batch */
-        int sent = sendmmsg(sock, msgs, batch, 0);
-
-        if (sent > 0) {
-            for (int i = 0; i < sent; i++) {
-                local_packets++;
-                local_bytes += pkt_sizes[i];
+        /* Send with optional inter-packet delay */
+        if (cfg->delay_ns > 0 && cfg->delay_per_packet) {
+            /* Per-packet delay mode: send one at a time */
+            struct timespec delay_ts = {
+                .tv_sec = (time_t)(cfg->delay_ns / 1000000000ULL),
+                .tv_nsec = (long)(cfg->delay_ns % 1000000000ULL)
+            };
+            for (int i = 0; i < batch && g_running; i++) {
+                ssize_t ret = sendto(sock, packets[i], pkt_sizes[i], 0, NULL, 0);
+                if (ret > 0) {
+                    local_packets++;
+                    local_bytes += pkt_sizes[i];
+                } else if (ret < 0 && errno != EAGAIN) {
+                    local_errors++;
+                }
+                nanosleep(&delay_ts, NULL);
             }
-        } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            local_errors++;
+        } else {
+            /* Batch mode */
+            int sent = sendmmsg(sock, msgs, batch, 0);
+
+            if (sent > 0) {
+                for (int i = 0; i < sent; i++) {
+                    local_packets++;
+                    local_bytes += pkt_sizes[i];
+                }
+            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                local_errors++;
+            }
+
+            /* Per-batch delay */
+            if (cfg->delay_ns > 0) {
+                struct timespec delay_ts = {
+                    .tv_sec = (time_t)(cfg->delay_ns / 1000000000ULL),
+                    .tv_nsec = (long)(cfg->delay_ns % 1000000000ULL)
+                };
+                nanosleep(&delay_ts, NULL);
+            }
         }
 
         /* Periodic stats update */
@@ -983,6 +1012,8 @@ static void print_usage(const char *prog) {
     printf("  --duration SEC           Duration in seconds\n");
     printf("  -w, --workers NUM        Worker threads (default: CPU count)\n");
     printf("  --batch NUM              Batch size (default: 512)\n");
+    printf("  -d, --delay DELAY        Inter-packet delay (e.g., 100ns, 10us, 1ms)\n");
+    printf("  --delay-per-pkt          Apply delay per packet (default: per batch)\n");
     printf("  --skb-priority NUM       Socket priority (SO_PRIORITY for tc/qdisc)\n");
     printf("                           Maps to tc filter prio or pfifo_fast bands\n");
     printf("\n");
@@ -1149,6 +1180,8 @@ int main(int argc, char *argv[]) {
         {"duration",      required_argument, 0, 1001},
         {"batch",         required_argument, 0, 1002},
         {"pps",           required_argument, 0, 1003},
+        {"delay",         required_argument, 0, 'd'},
+        {"delay-per-pkt", no_argument,       0, 1016},
         {"payload-type",  required_argument, 0, 1004},
         {"payload-pattern", required_argument, 0, 1005},
         {"payload-ascii", required_argument, 0, 1006},
@@ -1172,7 +1205,7 @@ int main(int argc, char *argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "a:b:A:B:c:l:p:P:Q:r:t:D:T:w:qvSh",
+    while ((opt = getopt_long(argc, argv, "a:b:A:B:c:d:l:p:P:Q:r:t:D:T:w:qvSh",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'a':
@@ -1209,6 +1242,25 @@ int main(int argc, char *argv[]) {
                 break;
             case 'c':
                 g_config.count = strtoull(optarg, NULL, 10);
+                break;
+            case 'd':
+                /* Parse delay: 100ns, 10us, 1ms, 1s */
+                {
+                    char *endptr;
+                    double val = strtod(optarg, &endptr);
+                    if (*endptr == 'n' || strstr(endptr, "ns")) {
+                        g_config.delay_ns = (uint64_t)val;
+                    } else if (*endptr == 'u' || strstr(endptr, "us")) {
+                        g_config.delay_ns = (uint64_t)(val * 1000);
+                    } else if (*endptr == 'm' || strstr(endptr, "ms")) {
+                        g_config.delay_ns = (uint64_t)(val * 1000000);
+                    } else if (*endptr == 's') {
+                        g_config.delay_ns = (uint64_t)(val * 1000000000);
+                    } else {
+                        /* Default: microseconds */
+                        g_config.delay_ns = (uint64_t)(val * 1000);
+                    }
+                }
                 break;
             case 'l':
                 if (parse_size_range(optarg, &g_config.packet_size_min, &g_config.packet_size_max)) {
@@ -1294,6 +1346,7 @@ int main(int argc, char *argv[]) {
                 g_config.skb_priority = atoi(optarg);
                 g_config.use_skb_priority = 1;
                 break;
+            case 1016: g_config.delay_per_packet = 1; break;
             case 1020: g_config.df_flag = 1; break;
             case 1021: g_config.add_seq_num = 1; break;
             case 1022: g_config.add_timestamp = 1; break;
@@ -1366,6 +1419,20 @@ int main(int argc, char *argv[]) {
         printf("  Duration:     %s\n", g_config.duration > 0 ? "" : "Infinite");
         if (g_config.duration > 0) printf("                %d seconds\n", g_config.duration);
         printf("  Workers:      %d, Batch: %d\n", g_config.num_workers, g_config.batch_size);
+        if (g_config.delay_ns > 0) {
+            if (g_config.delay_ns >= 1000000000ULL)
+                printf("  Delay:        %.3f s %s\n", g_config.delay_ns / 1e9,
+                       g_config.delay_per_packet ? "(per-pkt)" : "(per-batch)");
+            else if (g_config.delay_ns >= 1000000ULL)
+                printf("  Delay:        %.3f ms %s\n", g_config.delay_ns / 1e6,
+                       g_config.delay_per_packet ? "(per-pkt)" : "(per-batch)");
+            else if (g_config.delay_ns >= 1000ULL)
+                printf("  Delay:        %.3f us %s\n", g_config.delay_ns / 1e3,
+                       g_config.delay_per_packet ? "(per-pkt)" : "(per-batch)");
+            else
+                printf("  Delay:        %lu ns %s\n", g_config.delay_ns,
+                       g_config.delay_per_packet ? "(per-pkt)" : "(per-batch)");
+        }
         for (int i = 0; i < g_config.vlan_count; i++) {
             printf("  VLAN %d:       %d (PCP: %d, DEI: %d)\n",
                    i+1, g_config.vlan_id[i], g_config.vlan_prio[i], g_config.vlan_dei[i]);
