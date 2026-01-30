@@ -10,7 +10,7 @@
  * - Per-PCP/TC statistics for TSN analysis
  * - VLAN tag parsing (PCP, DEI, VID, QinQ)
  * - Latency and inter-arrival time measurement
- * - Sequence number tracking (per flow_id)
+ * - Sequence number tracking
  * - CSV export for analysis
  */
 
@@ -68,39 +68,17 @@ typedef struct {
 #pragma pack(pop)
 
 /*============================================================================
- * TSN Payload Header (inline)
+ * Simple Payload Header - 12 bytes
+ * seq(4B) + timestamp(8B)
  *============================================================================*/
-#define TSN_PAYLOAD_MAGIC       0x54534E31
-#define TSN_PAYLOAD_VERSION     1
-#define TSN_PAYLOAD_HDR_SIZE    24
-#define TSN_LEGACY_HDR_SIZE     12
-#define TSN_FLAG_SEQ            0x01
-#define TSN_FLAG_TIMESTAMP      0x02
-#define TSN_FLAG_FLOW_ID        0x04
+#define SIMPLE_PAYLOAD_SIZE    12
 
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t magic;
-    uint8_t  version;
-    uint8_t  flags;
-    uint8_t  flow_id;
-    uint8_t  reserved;
-    uint32_t seq_num;
-    uint64_t timestamp;
-    uint32_t payload_len;
-} tsn_payload_hdr_t;
+    uint32_t seq_num;     /* Sequence number (network order) */
+    uint64_t timestamp;   /* Timestamp in nanoseconds (host order) */
+} simple_payload_t;
 #pragma pack(pop)
-
-#define TSN_HDR_HAS_SEQ(hdr)       ((hdr)->flags & TSN_FLAG_SEQ)
-#define TSN_HDR_HAS_TIMESTAMP(hdr) ((hdr)->flags & TSN_FLAG_TIMESTAMP)
-#define TSN_HDR_HAS_FLOW_ID(hdr)   ((hdr)->flags & TSN_FLAG_FLOW_ID)
-
-static inline int tsn_is_new_format(const void *payload, size_t len) {
-    if (len < sizeof(uint32_t)) return 0;
-    uint32_t m;
-    memcpy(&m, payload, sizeof(m));
-    return (m == htonl(TSN_PAYLOAD_MAGIC));
-}
 
 /* SO_RXQ_OVFL for drop detection (if not defined) */
 #ifndef SO_RXQ_OVFL
@@ -111,7 +89,7 @@ static inline int tsn_is_new_format(const void *payload, size_t len) {
  * Constants
  *============================================================================*/
 
-#define VERSION "2.0.0"
+#define VERSION "2.1.0"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_BATCH_SIZE 256
@@ -173,10 +151,10 @@ typedef struct {
     /* Kernel/socket drops (from SO_RXQ_OVFL) */
     atomic_uint_fast64_t kernel_drops;
 
-    /* Global sequence tracking (per flow_id for multi-worker) */
+    /* Sequence tracking */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
-    uint32_t last_seq[256];  /* Per flow_id */
+    uint32_t last_seq;  /* Last seen sequence */
 
     /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
     uint64_t latency_sum;
@@ -289,12 +267,7 @@ static int get_if_index(const char *ifname) {
  *============================================================================*/
 
 /*
- * TSN Payload Header formats:
- *
- * New format (v1, 24 bytes): Magic + version + flags + flow_id + seq + timestamp + len
- * Legacy format (12 bytes): seq (4) + timestamp (8)
- *
- * TSN payload header definitions are inlined above.
+ * Simple Payload Header (12 bytes): seq(4B) + timestamp(8B)
  */
 typedef struct {
     uint8_t src_mac[6];
@@ -306,9 +279,7 @@ typedef struct {
     uint16_t ethertype;
     int payload_offset;
 
-    /* TSN header fields */
-    int new_format;         /* 1 = new 24-byte format, 0 = legacy */
-    uint8_t flow_id;        /* Flow ID from new header (or derived from PCP) */
+    /* Simple payload fields: seq(4B) + timestamp(8B) */
     uint32_t seq_num;
     uint64_t timestamp;
     int has_seq;
@@ -355,43 +326,21 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
             int payload_start = udp_offset + 8;
             int payload_len = len - payload_start;
 
-            /* Check for new TSN header format (24 bytes, magic = "TSN1") */
-            if (payload_len >= TSN_PAYLOAD_HDR_SIZE &&
-                tsn_is_new_format(buf + payload_start, payload_len)) {
-
-                const tsn_payload_hdr_t *hdr = (const tsn_payload_hdr_t *)(buf + payload_start);
-                pkt->new_format = 1;
-
-                if (TSN_HDR_HAS_FLOW_ID(hdr)) {
-                    pkt->flow_id = hdr->flow_id;
-                } else {
-                    /* Default: use PCP as flow_id */
-                    pkt->flow_id = pkt->has_vlan ? pkt->pcp : 0;
-                }
-
-                if (TSN_HDR_HAS_SEQ(hdr)) {
-                    pkt->seq_num = ntohl(hdr->seq_num);
-                    pkt->has_seq = 1;
-                }
-
-                if (TSN_HDR_HAS_TIMESTAMP(hdr)) {
-                    memcpy(&pkt->timestamp, &hdr->timestamp, sizeof(pkt->timestamp));
-                    pkt->has_timestamp = 1;
-                }
-            }
-            /* Legacy format (12 bytes): seq(4) + timestamp(8) */
-            else if (payload_len >= TSN_LEGACY_HDR_SIZE) {
-                pkt->new_format = 0;
-                pkt->flow_id = pkt->has_vlan ? pkt->pcp : 0;
-
+            /* Simple format (12 bytes): seq(4B) + timestamp(8B) */
+            if (payload_len >= SIMPLE_PAYLOAD_SIZE) {
                 /* First 4 bytes: sequence number (network order) */
                 memcpy(&pkt->seq_num, buf + payload_start, 4);
                 pkt->seq_num = ntohl(pkt->seq_num);
                 pkt->has_seq = 1;
 
-                /* Next 8 bytes: timestamp */
+                /* Next 8 bytes: timestamp (host order) */
                 memcpy(&pkt->timestamp, buf + payload_start + 4, 8);
                 pkt->has_timestamp = 1;
+            } else if (payload_len >= 4) {
+                /* At least sequence number */
+                memcpy(&pkt->seq_num, buf + payload_start, 4);
+                pkt->seq_num = ntohl(pkt->seq_num);
+                pkt->has_seq = 1;
             }
         }
     }
@@ -523,8 +472,8 @@ static void *rx_thread(void *arg) {
                 if (cfg->filter_pcp && (!pkt.has_vlan || pkt.pcp != cfg->pcp)) {
                     continue;
                 }
-                if (cfg->tsn_only && !pkt.new_format) {
-                    continue;  /* Skip non-TSN packets */
+                if (cfg->tsn_only && !pkt.has_seq) {
+                    continue;  /* Skip packets without seq header */
                 }
 
                 local_packets++;
@@ -556,17 +505,16 @@ static void *rx_thread(void *arg) {
                 } else {
                     atomic_fetch_add(&g_stats.non_vlan_packets, 1);
 
-                    /* Per-flow sequence tracking (for multi-worker mode) */
+                    /* Sequence tracking */
                     if (cfg->check_seq && pkt.has_seq) {
-                        uint32_t *last = &g_stats.last_seq[pkt.flow_id];
-                        if (*last != 0) {
-                            if (pkt.seq_num == *last) {
+                        if (g_stats.last_seq != 0) {
+                            if (pkt.seq_num == g_stats.last_seq) {
                                 atomic_fetch_add(&g_stats.seq_duplicates, 1);
-                            } else if (pkt.seq_num != *last + 1) {
+                            } else if (pkt.seq_num != g_stats.last_seq + 1) {
                                 atomic_fetch_add(&g_stats.seq_errors, 1);
                             }
                         }
-                        *last = pkt.seq_num;
+                        g_stats.last_seq = pkt.seq_num;
                     }
                 }
 
@@ -845,7 +793,7 @@ static void print_usage(const char *prog) {
     printf("  --batch NUM              Batch size (default: 256)\n");
     printf("\n");
     printf("Analysis:\n");
-    printf("  --seq                    Track sequence numbers (per-flow_id)\n");
+    printf("  --seq                    Track sequence numbers\n");
     printf("  --tsn-only               Only count packets with TSN header (filter noise)\n");
     printf("  --latency                Measure latency (requires tsngen --timestamp)\n");
     printf("  --pcp-stats              Show per-PCP statistics\n");

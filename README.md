@@ -130,52 +130,18 @@ Output:
 - **제한**: TX/RX가 같은 머신에서 동작해야 정확한 지연 측정
 - **Cross-machine**: PTP 동기화된 HW 타임스탬프 사용 필요
 
-## TSN Payload 헤더 (v1.7.0+)
+## Payload 헤더 (12 bytes)
 
-`--seq` 또는 `--timestamp` 사용 시 UDP payload에 구조화된 헤더 삽입:
-
-### 새 포맷 (24 bytes, 기본)
+`--seq` 또는 `--timestamp` 사용 시 UDP payload 앞에 삽입:
 
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Magic (0x54534E31 "TSN1")              |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|    Version    |    Flags      |   Flow ID     |   Reserved   |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Sequence Number                        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                    Timestamp (ns, host order)                +
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Payload Length                         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Bytes 0-3:  Sequence Number (network order, big-endian)
+Bytes 4-11: Timestamp (host order, nanoseconds)
 ```
 
-- **Magic**: `0x54534E31` ("TSN1") - 포맷 식별
-- **Flow ID**: `(TC << 4) | Worker` - per-flow 시퀀스 추적용
-- **Flags**: SEQ(0x01), TIMESTAMP(0x02), FLOW_ID(0x04)
-
-### 레거시 포맷 (12 bytes, `--legacy-payload`)
-
-```
-Bytes 0-3:  Sequence (network order)
-Bytes 4-11: Timestamp (host order)
-```
-
-이전 버전 호환용.
-
-### 시퀀스 번호 인코딩
-
-```
-Bits 31-29: TC (0-7)
-Bits 28-24: Worker ID (0-15)
-Bits 23-0:  Counter (~16M per worker)
-```
-
-예: TC2 Worker3 → 시퀀스 시작 = `0x23000000`
+- **--seq**: 시퀀스 번호 삽입 (4 bytes)
+- **--timestamp**: 타임스탬프 삽입 (8 bytes)
+- 둘 다 사용 시 총 12 bytes
 
 ## 드롭 감지
 
@@ -370,8 +336,9 @@ sudo ./tsncap eth0 --batch 512 ...
 ## 버전 히스토리
 
 ### tsngen
+- v2.1.0: 단순 payload 헤더 (12B: seq+timestamp), 복잡한 TSN1 헤더 제거
 - v2.0.0: pcap 재생 기능 (`--replay`), libpcap 미의존
-- v1.8.3: flow_id별 seq 추적, VLAN/QinQ 파서 수정, unaligned read 제거
+- v1.8.x: 버그 수정들 (token bucket, checksum, thread-safe rand 등)
 - v1.8.2: SO_PRIORITY/PACKET_FANOUT 제거 (의존성 간소화)
 - v1.8.1: token_bucket g_running 체크, --pps 옵션 동작 수정
 - v1.8.0: 버그 수정 - L4 체크섬 payload 반영, seq_num 이중 증가 수정, rand() thread-safe 변경
@@ -384,9 +351,9 @@ sudo ./tsncap eth0 --batch 512 ...
 - v1.0.0: 초기 버전
 
 ### tsncap (구 tsnrecv)
+- v2.1.0: 단순 payload 헤더 파싱 (12B: seq+timestamp)
 - v2.0.0: tsnrecv → tsncap 이름 변경, pcap 저장 기능 (`--pcap`), `--tsn-only` 필터
-- v1.3.2: per-flow_id seq 추적, VLAN/QinQ 파서 수정, unaligned read 제거
-- v1.3.0: TSN payload 헤더 v1 파싱, flow_id 지원, 레거시 호환
+- v1.x: VLAN/QinQ 파서, 시퀀스 추적, 지연 측정
 - v1.2.0: Latency 경고 (drops>0), CSV -1 처리, 버그 수정
 - v1.1.0: SO_RXQ_OVFL 드롭 감지, CLOCK_MONOTONIC_RAW, per-PCP 시퀀스, CPU affinity, CSV 스키마 표준화
 - v1.0.0: 초기 버전 (recvmmsg, PCP 통계, 지연 분석)

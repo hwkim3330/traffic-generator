@@ -76,50 +76,23 @@ typedef struct {
 #pragma pack(pop)
 
 /*============================================================================
- * TSN Payload Header (inline)
+ * Simple Payload Header - 12 bytes
+ * seq(4B) + timestamp(8B)
  *============================================================================*/
-#define TSN_PAYLOAD_VERSION     1
-#define TSN_PAYLOAD_MAGIC       0x54534E31  /* "TSN1" */
-#define TSN_PAYLOAD_HDR_SIZE    24
-#define TSN_FLAG_SEQ            0x01
-#define TSN_FLAG_TIMESTAMP      0x02
-#define TSN_FLAG_FLOW_ID        0x04
+#define SIMPLE_PAYLOAD_SIZE    12
 
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t magic;
-    uint8_t  version;
-    uint8_t  flags;
-    uint8_t  flow_id;
-    uint8_t  reserved;
-    uint32_t seq_num;
-    uint64_t timestamp;
-    uint32_t payload_len;
-} tsn_payload_hdr_t;
+    uint32_t seq_num;     /* Sequence number (network order) */
+    uint64_t timestamp;   /* Timestamp in nanoseconds (host order) */
+} simple_payload_t;
 #pragma pack(pop)
-
-#define TSN_HDR_HAS_SEQ(hdr)       ((hdr)->flags & TSN_FLAG_SEQ)
-
-static inline uint8_t tsn_encode_flow_id(uint8_t tc, uint8_t worker_id) {
-    return (uint8_t)((tc & 0x07) << 4) | (worker_id & 0x0F);
-}
-
-static inline uint32_t tsn_seq_start(uint8_t tc, uint8_t worker_id) {
-    return ((uint32_t)(tc & 0x07) << 28) | ((uint32_t)(worker_id & 0x0F) << 24);
-}
-
-static inline int tsn_is_new_format(const void *payload, size_t len) {
-    if (len < sizeof(uint32_t)) return 0;
-    uint32_t m;
-    memcpy(&m, payload, sizeof(m));
-    return (m == htonl(TSN_PAYLOAD_MAGIC));
-}
 
 /*============================================================================
  * Constants
  *============================================================================*/
 
-#define VERSION "2.0.0"
+#define VERSION "2.1.0"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_PACKET_SIZE 1472
@@ -250,7 +223,6 @@ typedef struct {
     /* Sequence & Timestamp */
     int add_seq_num;
     int add_timestamp;
-    int legacy_payload;     /* Use legacy 12-byte header instead of new 24-byte */
     uint8_t current_tc;     /* Current TC index (set by fork in multi-TC mode) */
 
     /* Statistics */
@@ -280,7 +252,7 @@ typedef struct {
     atomic_uint_fast64_t bytes_recv;
     atomic_uint_fast64_t packets_dropped;
     atomic_uint_fast64_t seq_errors;      /* Out of order / missing */
-    uint32_t last_seq[256];               /* Per flow_id tracking */
+    uint32_t last_seq;                    /* Last seen sequence */
 } rx_stats_t;
 
 /* Worker statistics */
@@ -307,7 +279,6 @@ typedef struct {
     worker_stats_t *stats;
     token_bucket_t *bucket;
     uint32_t seq_num;
-    uint32_t flow_idx;
 } worker_ctx_t;
 
 /*============================================================================
@@ -680,48 +651,14 @@ static void finalize_tcp_checksum(uint8_t *tcp_start, int total_len,
     tcp->check = tcp_udp_checksum(saddr, daddr, IPPROTO_TCP, tcp, total_len);
 }
 
-static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq, uint8_t worker_id) {
+static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq) {
     int hdr_size = 0;
     uint8_t *data_start = buf;
 
     /*
-     * TSN Payload Header (new format or legacy)
+     * Simple Payload Header: seq(4B) + timestamp(8B) = 12B
      */
-    if ((cfg->add_seq_num || cfg->add_timestamp) && !cfg->legacy_payload) {
-        /* New format: 24-byte structured header */
-        if (len >= TSN_PAYLOAD_HDR_SIZE) {
-            tsn_payload_hdr_t *hdr = (tsn_payload_hdr_t *)buf;
-
-            hdr->magic = htonl(TSN_PAYLOAD_MAGIC);
-            hdr->version = TSN_PAYLOAD_VERSION;
-            hdr->flags = 0;
-            hdr->reserved = 0;
-
-            /* Flow ID: encode TC and worker for per-flow tracking */
-            hdr->flow_id = tsn_encode_flow_id(cfg->current_tc, worker_id);
-            hdr->flags |= TSN_FLAG_FLOW_ID;
-
-            if (cfg->add_seq_num) {
-                hdr->seq_num = htonl(seq);
-                hdr->flags |= TSN_FLAG_SEQ;
-            } else {
-                hdr->seq_num = 0;
-            }
-
-            if (cfg->add_timestamp) {
-                uint64_t ts = get_time_ns();
-                memcpy(&hdr->timestamp, &ts, sizeof(ts));
-                hdr->flags |= TSN_FLAG_TIMESTAMP;
-            } else {
-                memset(&hdr->timestamp, 0, sizeof(hdr->timestamp));
-            }
-
-            hdr->payload_len = htonl(len - TSN_PAYLOAD_HDR_SIZE);
-            hdr_size = TSN_PAYLOAD_HDR_SIZE;
-            data_start = buf + hdr_size;
-        }
-    } else if ((cfg->add_seq_num || cfg->add_timestamp) && cfg->legacy_payload) {
-        /* Legacy format: 12-byte simple header (backward compatible) */
+    if (cfg->add_seq_num || cfg->add_timestamp) {
         if (cfg->add_seq_num && len >= 4) {
             uint32_t net_seq = htonl(seq);
             memcpy(buf, &net_seq, 4);
@@ -795,7 +732,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
     if (cfg->pkt_type == PKT_ETH_RAW) {
         int payload_len = pkt_size - offset;
         if (payload_len > 0) {
-            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num++, ctx->id);
+            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num++);
             offset += payload_len;
         }
     } else {
@@ -820,7 +757,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
         if (cfg->src_port_range) {
             sport = rand_port_in_range(cfg->src_port_start, cfg->src_port_end);
         } else {
-            sport = cfg->src_port + (ctx->id * 100) + (ctx->flow_idx % 100);
+            sport = cfg->src_port + ctx->id;
         }
 
         if (cfg->dst_port_range) {
@@ -853,7 +790,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
 
         /* Payload */
         if (payload_len > 0) {
-            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num, ctx->id);
+            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num);
             offset += payload_len;
         }
 
@@ -876,7 +813,6 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
         offset = 60;
     }
 
-    ctx->flow_idx++;
     return offset;
 }
 
@@ -1116,35 +1052,16 @@ static void *rx_thread(void *arg) {
                         int payload_start = off + ihl + 8;
                         int payload_len = len - payload_start;
 
-                        uint32_t seq = 0;
-                        uint8_t flow_id = 0;
-                        int found_seq = 0;
-
-                        /* Try new TSN header format first */
-                        if (payload_len >= TSN_PAYLOAD_HDR_SIZE &&
-                            tsn_is_new_format(buf + payload_start, payload_len)) {
-                            const tsn_payload_hdr_t *hdr = (const tsn_payload_hdr_t *)(buf + payload_start);
-                            flow_id = hdr->flow_id;
-                            if (TSN_HDR_HAS_SEQ(hdr)) {
-                                seq = ntohl(hdr->seq_num);
-                                found_seq = 1;
-                            }
-                        }
-                        /* Fall back to legacy format (flow_id=0) */
-                        else if (payload_len >= 4) {
+                        /* Simple seq format: first 4 bytes = seq number */
+                        if (payload_len >= 4) {
+                            uint32_t seq;
                             memcpy(&seq, buf + payload_start, 4);
                             seq = ntohl(seq);
-                            if (seq != TSN_PAYLOAD_MAGIC) {
-                                found_seq = 1;
-                            }
-                        }
 
-                        if (found_seq) {
-                            uint32_t *last = &g_rx_stats.last_seq[flow_id];
-                            if (*last != 0 && seq != *last + 1) {
+                            if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
                                 atomic_fetch_add(&g_rx_stats.seq_errors, 1);
                             }
-                            *last = seq;
+                            g_rx_stats.last_seq = seq;
                         }
                     }
                 }
@@ -1398,9 +1315,8 @@ static void print_usage(const char *prog) {
     printf("  --payload-type TYPE      zero, random, increment, pattern, ascii\n");
     printf("  --payload-pattern STR    Pattern string for payload\n");
     printf("  --payload-ascii TEXT     ASCII payload\n");
-    printf("  --seq                    Add sequence number to payload\n");
-    printf("  --timestamp              Add timestamp to payload\n");
-    printf("  --legacy-payload         Use legacy 12-byte header (default: new 24-byte)\n");
+    printf("  --seq                    Add sequence number to payload (4 bytes)\n");
+    printf("  --timestamp              Add timestamp to payload (8 bytes)\n");
     printf("\n");
     printf("Replay:\n");
     printf("  --replay FILE            Replay packets from pcap file\n");
@@ -1695,7 +1611,6 @@ int main(int argc, char *argv[]) {
         {"df",            no_argument,       0, 1020},
         {"seq",           no_argument,       0, 1021},
         {"timestamp",     no_argument,       0, 1022},
-        {"legacy-payload", no_argument,     0, 1026},
         {"ip-csum",       no_argument,       0, 1023},
         {"l4-csum",       no_argument,       0, 1024},
         {"quiet",         no_argument,       0, 'q'},
@@ -1703,7 +1618,7 @@ int main(int argc, char *argv[]) {
         {"simulation",    no_argument,       0, 'S'},
         {"help",          no_argument,       0, 'h'},
         {"version",       no_argument,       0, 1000},
-        {"replay",        required_argument, 0, 1027},
+        {"replay",        required_argument, 0, 1026},
         {0, 0, 0, 0}
     };
 
@@ -1872,8 +1787,7 @@ int main(int argc, char *argv[]) {
             case 1023: g_config.calc_ip_csum = 1; break;
             case 1024: g_config.calc_l4_csum = 1; break;
             case 1025: g_config.rate_per_tc = 1; break;
-            case 1026: g_config.legacy_payload = 1; break;
-            case 1027:
+            case 1026:
                 strncpy(g_config.replay_file, optarg, sizeof(g_config.replay_file) - 1);
                 break;
             case 'q': g_config.quiet = 1; break;
@@ -2031,13 +1945,9 @@ int main(int argc, char *argv[]) {
                 /* Clear multi-TC to prevent recursion */
                 g_config.multi_tc_count = 0;
 
-                /*
-                 * Sequence offset per TC:
-                 * Using new tsn_seq_start() for proper TC/worker encoding.
-                 * TC is encoded in upper bits of sequence number.
-                 */
+                /* Set current TC for this child process */
                 g_config.current_tc = tc;
-                g_config.tc_seq_offset = 0;  /* Will use tsn_seq_start() instead */
+                g_config.tc_seq_offset = tc * 100000000;  /* Simple offset per TC */
 
                 /* Quiet mode for children */
                 g_config.quiet = 1;
@@ -2082,13 +1992,8 @@ int main(int argc, char *argv[]) {
         contexts[i].cfg = &g_config;
         contexts[i].stats = &g_stats[i];
         contexts[i].bucket = &g_bucket;
-        /*
-         * Sequence number encoding (from tsn_payload.h):
-         * Upper 3 bits: TC (0-7)
-         * Next 4 bits: Worker ID (0-15)
-         * Lower 24 bits: Counter (~16M per worker)
-         */
-        contexts[i].seq_num = tsn_seq_start(g_config.current_tc, i);
+        /* Simple sequence: TC offset + worker offset */
+        contexts[i].seq_num = g_config.tc_seq_offset + (i * 10000000);
 
         if (pthread_create(&g_workers[i], NULL, worker_thread, &contexts[i]) != 0) {
             fprintf(stderr, "Failed to create worker %d\n", i);
