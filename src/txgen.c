@@ -504,7 +504,7 @@ static void token_bucket_init(token_bucket_t *tb, double rate_mbps, double rate_
         tb->max_tokens = (double)batch_size * pkt_size * 2;
     }
     tb->tokens = tb->max_tokens;
-    clock_gettime(CLOCK_MONOTONIC, &tb->last_update);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &tb->last_update);
 }
 
 static int token_bucket_consume(token_bucket_t *tb, size_t bytes) {
@@ -513,7 +513,7 @@ static int token_bucket_consume(token_bucket_t *tb, size_t bytes) {
     /* Lock-free: each worker has its own bucket, no contention */
     while (g_running) {
         struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        clock_gettime(CLOCK_MONOTONIC_RAW, &now);
         double elapsed_ns = (now.tv_sec - tb->last_update.tv_sec) * 1e9 +
                             (now.tv_nsec - tb->last_update.tv_nsec);
 
@@ -1860,6 +1860,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (g_config.ipv6_mode) {
+        fprintf(stderr, "Error: IPv6 TX not implemented (use rxcap for IPv6 RX)\n");
+        return 1;
+    }
+
     /* Print config (skip if multi-TC mode, handled separately) */
     if (!g_config.quiet && g_config.multi_tc_count <= 1) {
         printf("\nConfiguration:\n");
@@ -2005,10 +2010,16 @@ int main(int argc, char *argv[]) {
     if (strlen(g_config.replay_file) > 0) {
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
-        /* Use large max_tokens for replay (pcap frames vary in size) */
+        /* Replay mode: rate-based burst (100ms worth of data) */
         token_bucket_init(&g_buckets[0], g_config.rate_mbps, g_config.rate_pps,
                           g_config.batch_size, g_config.packet_size);
-        g_buckets[0].max_tokens = 64.0 * 1024 * 1024;  /* 64MB burst for replay */
+        if (g_config.rate_mbps > 0) {
+            /* 100ms burst at configured rate */
+            g_buckets[0].max_tokens = g_config.rate_mbps * 1e6 / 8.0 * 0.1;
+        } else {
+            /* No rate limit - large burst */
+            g_buckets[0].max_tokens = 64.0 * 1024 * 1024;
+        }
         g_buckets[0].tokens = g_buckets[0].max_tokens;
         return replay_pcap(&g_config);
     }
