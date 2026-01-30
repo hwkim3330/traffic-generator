@@ -1000,6 +1000,10 @@ static void *rx_thread(void *arg) {
     int rcvbuf = 64 * 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
+    /* Set receive timeout to avoid blocking forever */
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};  /* 100ms */
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     int ifindex = get_if_index(iface);
     if (ifindex < 0) {
         fprintf(stderr, "RX: Failed to get interface index for %s\n", iface);
@@ -1039,36 +1043,42 @@ static void *rx_thread(void *arg) {
             local_bytes += len;
 
             /* Check sequence number if present in UDP payload */
-            if (cfg->add_seq_num && len >= 46) {
-                /* Parse ethertype, skip VLAN tags */
+            if (cfg->add_seq_num && len >= 14) {
+                /* Parse ethertype, skip VLAN/QinQ tags */
                 int off = 12;
                 uint16_t ethertype = (buf[off] << 8) | buf[off + 1];
                 off = 14;
 
-                while ((ethertype == 0x8100 || ethertype == 0x88a8) && off + 4 <= len) {
+                /* Skip VLAN tags (802.1Q=0x8100, QinQ=0x88a8, 802.1ad=0x9100) */
+                while ((ethertype == 0x8100 || ethertype == 0x88a8 || ethertype == 0x9100)
+                       && off + 4 <= len) {
                     ethertype = (buf[off + 2] << 8) | buf[off + 3];
                     off += 4;
                 }
 
-                /* Check for IPv4 */
-                if (ethertype == 0x0800 && off + 20 <= len && (buf[off] >> 4) == 4) {
-                    int ihl = (buf[off] & 0x0F) * 4;
-                    uint8_t proto = buf[off + 9];
+                /* Check for IPv4 UDP */
+                if (ethertype == 0x0800 && off + 20 <= len) {
+                    uint8_t ver = buf[off] >> 4;
+                    if (ver == 4) {
+                        int ihl = (buf[off] & 0x0F) * 4;
+                        if (ihl >= 20 && off + ihl <= len) {
+                            uint8_t proto = buf[off + 9];
+                            if (proto == 17 && off + ihl + 8 <= len) {  /* UDP */
+                                int payload_start = off + ihl + 8;
+                                int payload_len = len - payload_start;
 
-                    if (proto == 17 && off + ihl + 8 <= len) {  /* UDP */
-                        int payload_start = off + ihl + 8;
-                        int payload_len = len - payload_start;
+                                /* Simple seq format: first 4 bytes = seq number */
+                                if (payload_len >= 4) {
+                                    uint32_t seq;
+                                    memcpy(&seq, buf + payload_start, 4);
+                                    seq = ntohl(seq);
 
-                        /* Simple seq format: first 4 bytes = seq number */
-                        if (payload_len >= 4) {
-                            uint32_t seq;
-                            memcpy(&seq, buf + payload_start, 4);
-                            seq = ntohl(seq);
-
-                            if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
-                                atomic_fetch_add(&g_rx_stats.seq_errors, 1);
+                                    if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
+                                        atomic_fetch_add(&g_rx_stats.seq_errors, 1);
+                                    }
+                                    g_rx_stats.last_seq = seq;
+                                }
                             }
-                            g_rx_stats.last_seq = seq;
                         }
                     }
                 }
@@ -1087,6 +1097,7 @@ static void *rx_thread(void *arg) {
                 last_update = now;
             }
         }
+        /* Timeout or no data - just continue (handled by SO_RCVTIMEO) */
     }
 
     atomic_fetch_add(&g_rx_stats.packets_recv, local_packets);
