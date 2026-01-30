@@ -11,11 +11,10 @@
 
 ## 주요 기능
 
-### tsngen (TX) v1.8.1
+### tsngen (TX) v1.8.2
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
 - **Multi-TC 모드** - 8개 TC 동시 전송
 - **VLAN PCP/DEI** 지원
-- **tc/qdisc 연동** (SO_PRIORITY, PACKET_FANOUT)
 - **토큰 버킷** 정밀 레이트 제한
 - **--rate-per-tc** - Multi-TC 레이트 정책 명확화
 - **패킷간 딜레이** (ns/us/ms 정밀도)
@@ -348,12 +347,13 @@ sudo ./tsnrecv eth0 --batch 512 ...
 ## 버전 히스토리
 
 ### tsngen
+- v1.8.2: SO_PRIORITY/PACKET_FANOUT 제거 (의존성 간소화)
 - v1.8.1: token_bucket g_running 체크, --pps 옵션 동작 수정
 - v1.8.0: 버그 수정 - L4 체크섬 payload 반영, seq_num 이중 증가 수정, rand() thread-safe 변경
 - v1.7.0: 표준 TSN payload 헤더 (24B), flow_id, --legacy-payload
 - v1.6.0: Multi-TC 시퀀스 충돌 수정 (TC별 offset)
 - v1.5.0: CLOCK_MONOTONIC_RAW, --rate-per-tc 옵션
-- v1.4.0: PACKET_FANOUT, CPU Affinity, RX 통계
+- v1.4.0: CPU Affinity, RX 통계
 - v1.3.0: Multi-TC 모드
 - v1.2.x: tc 연동, VLAN DEI, 딜레이
 - v1.0.0: 초기 버전

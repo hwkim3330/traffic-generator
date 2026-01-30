@@ -88,28 +88,11 @@ static inline int tsn_is_new_format(const void *payload, size_t len) {
     return (*(const uint32_t *)payload == htonl(TSN_PAYLOAD_MAGIC));
 }
 
-/* PACKET_FANOUT definitions (if not provided by system headers) */
-#ifndef PACKET_FANOUT
-#define PACKET_FANOUT 18
-#endif
-#ifndef PACKET_FANOUT_HASH
-#define PACKET_FANOUT_HASH 0
-#endif
-#ifndef PACKET_FANOUT_LB
-#define PACKET_FANOUT_LB 1
-#endif
-#ifndef PACKET_FANOUT_CPU
-#define PACKET_FANOUT_CPU 2
-#endif
-#ifndef PACKET_FANOUT_RND
-#define PACKET_FANOUT_RND 4
-#endif
-
 /*============================================================================
  * Constants
  *============================================================================*/
 
-#define VERSION "1.8.1"
+#define VERSION "1.8.2"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_PACKET_SIZE 1472
@@ -166,10 +149,6 @@ typedef struct {
     uint16_t vlan_id[8];
     uint8_t vlan_prio[8];   /* PCP: Priority Code Point (0-7) */
     uint8_t vlan_dei[8];    /* DEI: Drop Eligible Indicator (0-1) */
-
-    /* Socket priority (for tc/qdisc integration) */
-    int skb_priority;       /* SO_PRIORITY value */
-    int use_skb_priority;
 
     /* Multi-TC mode */
     uint8_t multi_tc[8];    /* TC list to use */
@@ -258,11 +237,6 @@ typedef struct {
     /* Checksum */
     int calc_ip_csum;
     int calc_l4_csum;
-
-    /* PACKET_FANOUT */
-    int use_fanout;
-    int fanout_mode;      /* PACKET_FANOUT_HASH, _CPU, _LB, etc. */
-    int fanout_group;
 
     /* RX mode */
     int rx_mode;          /* 0=TX only, 1=RX only, 2=TX+RX */
@@ -898,13 +872,6 @@ static void *worker_thread(void *arg) {
     int sndbuf = 64 * 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-    /* Set socket priority for tc/qdisc integration */
-    if (cfg->use_skb_priority) {
-        if (setsockopt(sock, SOL_SOCKET, SO_PRIORITY, &cfg->skb_priority, sizeof(cfg->skb_priority)) < 0) {
-            perror("SO_PRIORITY");
-        }
-    }
-
     /* CPU affinity (apply early) */
     if (cfg->use_affinity) {
         cpu_set_t cpuset;
@@ -933,17 +900,6 @@ static void *worker_thread(void *arg) {
     }
 
     ctx->socket_fd = sock;
-
-    /* PACKET_FANOUT for multi-queue distribution (after bind) */
-    if (cfg->use_fanout) {
-        int fanout_arg = (cfg->fanout_group & 0xFFFF) | (cfg->fanout_mode << 16);
-        if (setsockopt(sock, SOL_PACKET, PACKET_FANOUT, &fanout_arg, sizeof(fanout_arg)) < 0) {
-            /* Non-fatal: some NICs don't support fanout */
-            if (ctx->id == 0 && cfg->verbose) {
-                fprintf(stderr, "Warning: PACKET_FANOUT not supported on this interface\n");
-            }
-        }
-    }
 
     /* Pre-allocate packets */
     int batch = cfg->batch_size;
@@ -1401,8 +1357,6 @@ static void print_usage(const char *prog) {
     printf("  --batch NUM              Batch size (default: 512)\n");
     printf("  -d, --delay DELAY        Inter-packet delay (e.g., 100ns, 10us, 1ms)\n");
     printf("  --delay-per-pkt          Apply delay per packet (default: per batch)\n");
-    printf("  --skb-priority NUM       Socket priority (SO_PRIORITY for tc/qdisc)\n");
-    printf("                           Maps to tc filter prio or pfifo_fast bands\n");
     printf("  --multi-tc TC_SPEC[:VLAN]  Send to multiple TCs simultaneously\n");
     printf("                           TC_SPEC: 0-7, 0,2,4,6, or 0-3,6-7\n");
     printf("                           Example: --multi-tc 0-7:100\n");
@@ -1410,7 +1364,6 @@ static void print_usage(const char *prog) {
     printf("                           Without this flag in multi-TC: rate is total, split across TCs\n");
     printf("\n");
     printf("Performance:\n");
-    printf("  --fanout[=MODE]          PACKET_FANOUT for multi-queue (hash,lb,cpu,rnd)\n");
     printf("  --affinity               Pin worker threads to CPU cores\n");
     printf("\n");
     printf("RX Statistics:\n");
@@ -1626,10 +1579,8 @@ int main(int argc, char *argv[]) {
         {"tcp-seq",       required_argument, 0, 1009},
         {"tcp-ack",       required_argument, 0, 1010},
         {"tcp-win",       required_argument, 0, 1011},
-        {"skb-priority",  required_argument, 0, 1015},
         {"multi-tc",      required_argument, 0, 1017},
         {"rate-per-tc",   no_argument,       0, 1025},
-        {"fanout",        optional_argument, 0, 1018},
         {"affinity",      no_argument,       0, 1019},
         {"rx",            optional_argument, 0, 'R'},
         {"df",            no_argument,       0, 1020},
@@ -1784,10 +1735,6 @@ int main(int argc, char *argv[]) {
             case 1009: g_config.tcp_seq = strtoul(optarg, NULL, 10); break;
             case 1010: g_config.tcp_ack = strtoul(optarg, NULL, 10); break;
             case 1011: g_config.tcp_window = atoi(optarg); break;
-            case 1015:
-                g_config.skb_priority = atoi(optarg);
-                g_config.use_skb_priority = 1;
-                break;
             case 1016: g_config.delay_per_packet = 1; break;
             case 1017:
                 {
@@ -1798,25 +1745,6 @@ int main(int argc, char *argv[]) {
                         *colon = '\0';
                     }
                     parse_multi_tc(optarg, &g_config);
-                }
-                break;
-            case 1018:
-                /* --fanout[=MODE] where MODE: hash, lb, cpu, rnd */
-                g_config.use_fanout = 1;
-                g_config.fanout_group = getpid() & 0xFFFF;
-                if (optarg) {
-                    if (strcmp(optarg, "hash") == 0)
-                        g_config.fanout_mode = PACKET_FANOUT_HASH;
-                    else if (strcmp(optarg, "lb") == 0)
-                        g_config.fanout_mode = PACKET_FANOUT_LB;
-                    else if (strcmp(optarg, "cpu") == 0)
-                        g_config.fanout_mode = PACKET_FANOUT_CPU;
-                    else if (strcmp(optarg, "rnd") == 0)
-                        g_config.fanout_mode = PACKET_FANOUT_RND;
-                    else
-                        g_config.fanout_mode = PACKET_FANOUT_HASH;
-                } else {
-                    g_config.fanout_mode = PACKET_FANOUT_CPU;
                 }
                 break;
             case 1019:
@@ -1921,7 +1849,6 @@ int main(int argc, char *argv[]) {
                    i+1, g_config.vlan_id[i], g_config.vlan_prio[i], g_config.vlan_dei[i]);
         }
         if (g_config.dscp > 0) printf("  DSCP:         %d\n", g_config.dscp);
-        if (g_config.use_skb_priority) printf("  SKB Priority: %d\n", g_config.skb_priority);
         if (g_config.add_seq_num) printf("  Sequence:     Enabled\n");
         if (g_config.add_timestamp) printf("  Timestamp:    Enabled\n");
     }
@@ -1982,10 +1909,6 @@ int main(int argc, char *argv[]) {
                 g_config.vlan_id[0] = g_config.multi_tc_vlan;
                 g_config.vlan_prio[0] = tc;
                 g_config.vlan_dei[0] = 0;
-
-                /* Set SKB priority */
-                g_config.skb_priority = tc;
-                g_config.use_skb_priority = 1;
 
                 /* Apply calculated rate */
                 g_config.rate_mbps = rate_per_tc_mbps;
