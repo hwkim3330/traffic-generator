@@ -164,7 +164,9 @@ typedef struct {
     /* Sequence tracking */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
+    uint32_t first_seq; /* First seen sequence */
     uint32_t last_seq;  /* Last seen sequence */
+    int seq_started;    /* Flag: have we seen first seq? */
 
     /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
     atomic_uint_fast64_t latency_sum;
@@ -212,20 +214,28 @@ static int pcap_open(const char *filename) {
     return 0;
 }
 
-/* Write packet to pcap file */
-static void pcap_write(const uint8_t *data, int len, uint64_t ts_ns) {
-    if (!g_pcap_fp) return;
+/* Batch PCAP write entry */
+typedef struct {
+    uint8_t *data;
+    int len;
+    uint64_t ts_ns;
+} pcap_entry_t;
 
-    pcap_pkthdr_t pkthdr = {
-        .ts_sec = (uint32_t)(ts_ns / 1000000000ULL),
-        .ts_usec = (uint32_t)((ts_ns % 1000000000ULL) / 1000),
-        .incl_len = len,
-        .orig_len = len
-    };
+/* Batch write multiple packets to pcap (single lock acquisition) */
+static void pcap_write_batch(pcap_entry_t *entries, int count) {
+    if (!g_pcap_fp || count == 0) return;
 
     pthread_mutex_lock(&g_pcap_lock);
-    fwrite(&pkthdr, sizeof(pkthdr), 1, g_pcap_fp);
-    fwrite(data, len, 1, g_pcap_fp);
+    for (int i = 0; i < count; i++) {
+        pcap_pkthdr_t pkthdr = {
+            .ts_sec = (uint32_t)(entries[i].ts_ns / 1000000000ULL),
+            .ts_usec = (uint32_t)((entries[i].ts_ns % 1000000000ULL) / 1000),
+            .incl_len = entries[i].len,
+            .orig_len = entries[i].len
+        };
+        fwrite(&pkthdr, sizeof(pkthdr), 1, g_pcap_fp);
+        fwrite(entries[i].data, entries[i].len, 1, g_pcap_fp);
+    }
     pthread_mutex_unlock(&g_pcap_lock);
 }
 
@@ -309,8 +319,8 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     uint16_t ethertype = (buf[offset] << 8) | buf[offset + 1];
     offset += 2;
 
-    /* Check for VLAN tags (single or QinQ) */
-    while ((ethertype == 0x8100 || ethertype == 0x88a8) && offset + 4 <= len) {
+    /* Check for VLAN tags (single, QinQ, or 802.1ad provider) */
+    while ((ethertype == 0x8100 || ethertype == 0x88a8 || ethertype == 0x9100) && offset + 4 <= len) {
         if (!pkt->has_vlan) {
             pkt->has_vlan = 1;
             uint16_t tci = (buf[offset] << 8) | buf[offset + 1];
@@ -326,33 +336,48 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     pkt->payload_offset = offset;
 
     /* Try to extract seq/timestamp from UDP payload */
+    int udp_payload_start = -1;
+    int udp_payload_len = 0;
+
     if (ethertype == 0x0800 && len >= offset + 20 + 8) {
+        /* IPv4 */
         int ip_offset = offset;
         int ihl = (buf[ip_offset] & 0x0F) * 4;
         uint8_t ip_proto = buf[ip_offset + 9];
 
         if (ip_proto == 17 && len >= ip_offset + ihl + 8) {  /* UDP */
-            int udp_offset = ip_offset + ihl;
-            int payload_start = udp_offset + 8;
-            int payload_len = len - payload_start;
+            udp_payload_start = ip_offset + ihl + 8;
+            udp_payload_len = len - udp_payload_start;
+        }
+    } else if (ethertype == 0x86dd && len >= offset + 40 + 8) {
+        /* IPv6 (40-byte fixed header) */
+        int ip6_offset = offset;
+        uint8_t next_hdr = buf[ip6_offset + 6];
 
-            /* Simple format (12 bytes): seq(4B) + timestamp(8B) */
-            if (payload_len >= SIMPLE_PAYLOAD_SIZE) {
-                /* First 4 bytes: sequence number (network order) */
-                memcpy(&pkt->seq_num, buf + payload_start, 4);
-                pkt->seq_num = ntohl(pkt->seq_num);
-                pkt->has_seq = 1;
+        if (next_hdr == 17 && len >= ip6_offset + 40 + 8) {  /* UDP */
+            udp_payload_start = ip6_offset + 40 + 8;
+            udp_payload_len = len - udp_payload_start;
+        }
+        /* Note: Extension headers not supported - assumes UDP follows directly */
+    }
 
-                /* Next 8 bytes: timestamp (network order) */
-                memcpy(&pkt->timestamp, buf + payload_start + 4, 8);
-                pkt->timestamp = ntohll(pkt->timestamp);
-                pkt->has_timestamp = (pkt->timestamp != 0);
-            } else if (payload_len >= 4) {
-                /* At least sequence number */
-                memcpy(&pkt->seq_num, buf + payload_start, 4);
-                pkt->seq_num = ntohl(pkt->seq_num);
-                pkt->has_seq = 1;
-            }
+    if (udp_payload_start >= 0) {
+        /* Simple format (12 bytes): seq(4B) + timestamp(8B) */
+        if (udp_payload_len >= SIMPLE_PAYLOAD_SIZE) {
+            /* First 4 bytes: sequence number (network order) */
+            memcpy(&pkt->seq_num, buf + udp_payload_start, 4);
+            pkt->seq_num = ntohl(pkt->seq_num);
+            pkt->has_seq = 1;
+
+            /* Next 8 bytes: timestamp (network order) */
+            memcpy(&pkt->timestamp, buf + udp_payload_start + 4, 8);
+            pkt->timestamp = ntohll(pkt->timestamp);
+            pkt->has_timestamp = (pkt->timestamp != 0);
+        } else if (udp_payload_len >= 4) {
+            /* At least sequence number */
+            memcpy(&pkt->seq_num, buf + udp_payload_start, 4);
+            pkt->seq_num = ntohl(pkt->seq_num);
+            pkt->has_seq = 1;
         }
     }
 
@@ -445,6 +470,12 @@ static void *rx_thread(void *arg) {
     uint64_t local_bytes = 0;
     uint64_t last_drop_count = 0;
 
+    /* PCAP batch buffer */
+    pcap_entry_t *pcap_entries = NULL;
+    if (g_pcap_fp) {
+        pcap_entries = malloc(batch * sizeof(pcap_entry_t));
+    }
+
     while (g_running) {
         /* Reset control message lengths */
         for (int i = 0; i < batch; i++) {
@@ -454,9 +485,10 @@ static void *rx_thread(void *arg) {
         int received = recvmmsg(sock, msgs, batch, MSG_DONTWAIT, NULL);
 
         if (received > 0) {
-            uint64_t now_ns = get_time_ns();
+            int pcap_count = 0;  /* Number of packets to write to pcap */
 
             for (int i = 0; i < received; i++) {
+                uint64_t now_ns = get_time_ns();  /* Per-packet timestamp */
                 int len = msgs[i].msg_len;
                 uint8_t *buf = buffers[i];
 
@@ -490,9 +522,12 @@ static void *rx_thread(void *arg) {
                 local_packets++;
                 local_bytes += len;
 
-                /* Write to pcap file */
-                if (g_pcap_fp) {
-                    pcap_write(buf, len, now_ns);
+                /* Queue for pcap batch write */
+                if (pcap_entries) {
+                    pcap_entries[pcap_count].data = buf;
+                    pcap_entries[pcap_count].len = len;
+                    pcap_entries[pcap_count].ts_ns = now_ns;
+                    pcap_count++;
                 }
 
                 /* Update PCP stats */
@@ -518,7 +553,10 @@ static void *rx_thread(void *arg) {
 
                     /* Sequence tracking */
                     if (cfg->check_seq && pkt.has_seq) {
-                        if (g_stats.last_seq != 0) {
+                        if (!g_stats.seq_started) {
+                            g_stats.first_seq = pkt.seq_num;
+                            g_stats.seq_started = 1;
+                        } else {
                             if (pkt.seq_num == g_stats.last_seq) {
                                 atomic_fetch_add(&g_stats.seq_duplicates, 1);
                             } else if (pkt.seq_num != g_stats.last_seq + 1) {
@@ -534,12 +572,18 @@ static void *rx_thread(void *arg) {
                     uint64_t latency = now_ns - pkt.timestamp;
                     atomic_fetch_add(&g_stats.latency_sum, latency);
                     atomic_fetch_add(&g_stats.latency_count, 1);
+
+                    /* CAS loop for min */
                     uint64_t cur_min = atomic_load(&g_stats.latency_min);
-                    if (latency < cur_min || cur_min == 0) {
-                        atomic_store(&g_stats.latency_min, latency);
+                    while (latency < cur_min || cur_min == 0) {
+                        if (atomic_compare_exchange_weak(&g_stats.latency_min, &cur_min, latency))
+                            break;
                     }
-                    if (latency > atomic_load(&g_stats.latency_max)) {
-                        atomic_store(&g_stats.latency_max, latency);
+                    /* CAS loop for max */
+                    uint64_t cur_max = atomic_load(&g_stats.latency_max);
+                    while (latency > cur_max) {
+                        if (atomic_compare_exchange_weak(&g_stats.latency_max, &cur_max, latency))
+                            break;
                     }
                 }
 
@@ -548,15 +592,26 @@ static void *rx_thread(void *arg) {
                     uint64_t iat = now_ns - g_stats.last_arrival_ns;
                     atomic_fetch_add(&g_stats.iat_sum, iat);
                     atomic_fetch_add(&g_stats.iat_count, 1);
+
+                    /* CAS loop for min */
                     uint64_t cur_min = atomic_load(&g_stats.iat_min);
-                    if (iat < cur_min || cur_min == 0) {
-                        atomic_store(&g_stats.iat_min, iat);
+                    while (iat < cur_min || cur_min == 0) {
+                        if (atomic_compare_exchange_weak(&g_stats.iat_min, &cur_min, iat))
+                            break;
                     }
-                    if (iat > atomic_load(&g_stats.iat_max)) {
-                        atomic_store(&g_stats.iat_max, iat);
+                    /* CAS loop for max */
+                    uint64_t cur_max = atomic_load(&g_stats.iat_max);
+                    while (iat > cur_max) {
+                        if (atomic_compare_exchange_weak(&g_stats.iat_max, &cur_max, iat))
+                            break;
                     }
                 }
                 g_stats.last_arrival_ns = now_ns;
+            }
+
+            /* Batch write to pcap (single lock acquisition per batch) */
+            if (pcap_entries && pcap_count > 0) {
+                pcap_write_batch(pcap_entries, pcap_count);
             }
 
             atomic_fetch_add(&g_stats.total_packets, local_packets);
@@ -582,6 +637,7 @@ static void *rx_thread(void *arg) {
     free(buffers);
     free(cmsg_bufs);
     free(msgs);
+    free(pcap_entries);
     free(iovecs);
     close(sock);
 
@@ -763,12 +819,24 @@ static void *stats_thread(void *arg) {
         }
 
         /* Global sequence analysis (for non-VLAN traffic) */
-        if (cfg->check_seq && nonvlan_pkts > 0) {
+        if (cfg->check_seq && g_stats.seq_started) {
             uint64_t seq_errors = atomic_load(&g_stats.seq_errors);
             uint64_t seq_dups = atomic_load(&g_stats.seq_duplicates);
+            uint32_t seq_range = g_stats.last_seq - g_stats.first_seq + 1;
+            uint64_t received = nonvlan_pkts - seq_dups;
+
             printf("\n  Sequence Analysis (non-VLAN):\n");
             printf("    Out-of-order: %lu\n", seq_errors);
             printf("    Duplicates:   %lu\n", seq_dups);
+
+            /* Loss calculation only valid for single-worker (contiguous seq) */
+            if (seq_range > 0 && seq_range <= received * 2) {
+                int64_t lost = (int64_t)seq_range - (int64_t)received;
+                if (lost > 0) {
+                    double loss_pct = lost * 100.0 / seq_range;
+                    printf("    Lost:         %ld (%.2f%%)\n", lost, loss_pct);
+                }
+            }
         }
 
         /* Latency stats */
@@ -962,6 +1030,8 @@ int main(int argc, char *argv[]) {
     if (strlen(g_config.pcap_file) > 0) {
         if (pcap_open(g_config.pcap_file) < 0) {
             fprintf(stderr, "Failed to open pcap file: %s\n", g_config.pcap_file);
+        } else {
+            fprintf(stderr, "Warning: PCAP enabled - may cause drops at high rates (>5Gbps)\n");
         }
     }
 

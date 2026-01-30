@@ -933,8 +933,14 @@ static void *worker_thread(void *arg) {
                     local_packets++;
                     local_bytes += pkt_sizes[i];
                 }
-            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                local_errors++;
+                /* Count unsent packets as errors */
+                if (sent < batch) {
+                    local_errors += (batch - sent);
+                }
+            } else if (sent < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    local_errors += batch;  /* All packets failed */
+                }
             }
 
             /* Per-batch delay */
@@ -1730,7 +1736,10 @@ int main(int argc, char *argv[]) {
                 break;
             case 't':
                 if (strcmp(optarg, "udp") == 0) g_config.pkt_type = PKT_UDP;
-                else if (strcmp(optarg, "tcp") == 0) g_config.pkt_type = PKT_TCP;
+                else if (strcmp(optarg, "tcp") == 0) {
+                    g_config.pkt_type = PKT_TCP;
+                    fprintf(stderr, "Note: TCP mode is stateless (no handshake, for traffic generation only)\n");
+                }
                 else if (strcmp(optarg, "icmp") == 0) g_config.pkt_type = PKT_ICMP;
                 else if (strcmp(optarg, "raw") == 0) g_config.pkt_type = PKT_ETH_RAW;
                 else {
