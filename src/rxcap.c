@@ -545,7 +545,14 @@ static void *rx_thread(void *arg) {
                     if (cfg->check_seq && pkt.has_seq) {
                         pcp_stats_t *pcp_stat = &g_stats.pcp[pkt.pcp];
                         if (pcp_stat->last_seq != 0) {
-                            if (pkt.seq_num == pcp_stat->last_seq) {
+                            /* Detect wraparound/restart: seq decreased by >50% of range */
+                            if (pkt.seq_num < pcp_stat->last_seq &&
+                                (pcp_stat->last_seq - pkt.seq_num) > 0x80000000U) {
+                                /* Likely wraparound, not an error */
+                            } else if (pkt.seq_num < pcp_stat->last_seq) {
+                                /* Sequence restarted - reset tracking */
+                                pcp_stat->last_seq = 0;
+                            } else if (pkt.seq_num == pcp_stat->last_seq) {
                                 atomic_fetch_add(&pcp_stat->seq_duplicates, 1);
                             } else if (pkt.seq_num != pcp_stat->last_seq + 1) {
                                 atomic_fetch_add(&pcp_stat->seq_errors, 1);
@@ -626,7 +633,11 @@ static void *rx_thread(void *arg) {
             atomic_fetch_add(&g_stats.total_bytes, local_bytes);
             local_packets = 0;
             local_bytes = 0;
-        } else if (received < 0) {
+        } else if (received == 0) {
+            /* No packets available - avoid busy spin */
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
+            nanosleep(&ts, NULL);
+        } else {  /* received < 0 */
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Avoid busy spin - sleep 100us */
                 struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
@@ -842,10 +853,9 @@ static void *stats_thread(void *arg) {
             printf("    Duplicates:   %lu\n", seq_dups);
 
             /* Loss estimate: only meaningful for single-worker + contiguous seq
-             * Use seq_errors + kernel_drops for reliable loss indication */
-            if (seq_range > 0 && seq_range == received + seq_errors - seq_dups + 1) {
-                /* Perfect match - no loss detected */
-            } else if (seq_range > 0 && seq_range <= received * 2 && seq_range > received) {
+             * Skip if kernel_drops > 0 (receiver bottleneck makes estimate meaningless) */
+            if (kernel_drops == 0 && seq_range > 0 && seq_range > received &&
+                seq_range <= received * 2) {
                 int64_t lost = (int64_t)seq_range - (int64_t)received;
                 double loss_pct = lost * 100.0 / seq_range;
                 printf("    Lost (est):   %ld (%.2f%%) - assumes contiguous seq\n", lost, loss_pct);
@@ -1053,9 +1063,38 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Initialize (g_stats is static, already zero-initialized) */
+    /* Initialize */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    /* Explicit atomic init (safe for re-run, library use, or unit tests) */
+    atomic_store(&g_stats.total_packets, 0);
+    atomic_store(&g_stats.total_bytes, 0);
+    atomic_store(&g_stats.vlan_packets, 0);
+    atomic_store(&g_stats.non_vlan_packets, 0);
+    atomic_store(&g_stats.kernel_drops, 0);
+    atomic_store(&g_stats.seq_errors, 0);
+    atomic_store(&g_stats.seq_duplicates, 0);
+    atomic_store(&g_stats.seq_started, 0);
+    atomic_store(&g_stats.first_seq, 0);
+    atomic_store(&g_stats.last_seq, 0);
+    atomic_store(&g_stats.latency_sum, 0);
+    atomic_store(&g_stats.latency_count, 0);
+    atomic_store(&g_stats.latency_min, 0);
+    atomic_store(&g_stats.latency_max, 0);
+    atomic_store(&g_stats.iat_sum, 0);
+    atomic_store(&g_stats.iat_count, 0);
+    atomic_store(&g_stats.iat_min, 0);
+    atomic_store(&g_stats.iat_max, 0);
+    g_stats.last_arrival_ns = 0;
+    for (int p = 0; p < MAX_PCP; p++) {
+        atomic_store(&g_stats.pcp[p].packets, 0);
+        atomic_store(&g_stats.pcp[p].bytes, 0);
+        atomic_store(&g_stats.pcp[p].seq_errors, 0);
+        atomic_store(&g_stats.pcp[p].seq_duplicates, 0);
+        g_stats.pcp[p].last_seq = 0;
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
 
     /* Start RX thread */
