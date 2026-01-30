@@ -1,5 +1,5 @@
 /*
- * trafgen - High-Performance Traffic Generator v1.3.0
+ * trafgen - High-Performance Traffic Generator v1.4.0
  * Based on Mausezahn concepts, enhanced with modern Linux networking features
  *
  * Copyright (C) 2025
@@ -48,12 +48,30 @@
 #include <netinet/ip_icmp.h>
 #include <netpacket/packet.h>
 #include <linux/if_ether.h>
+#include <sched.h>
+
+/* PACKET_FANOUT definitions (if not provided by system headers) */
+#ifndef PACKET_FANOUT
+#define PACKET_FANOUT 18
+#endif
+#ifndef PACKET_FANOUT_HASH
+#define PACKET_FANOUT_HASH 0
+#endif
+#ifndef PACKET_FANOUT_LB
+#define PACKET_FANOUT_LB 1
+#endif
+#ifndef PACKET_FANOUT_CPU
+#define PACKET_FANOUT_CPU 2
+#endif
+#ifndef PACKET_FANOUT_RND
+#define PACKET_FANOUT_RND 4
+#endif
 
 /*============================================================================
  * Constants
  *============================================================================*/
 
-#define VERSION "1.3.0"
+#define VERSION "1.4.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
@@ -197,7 +215,28 @@ typedef struct {
     /* Checksum */
     int calc_ip_csum;
     int calc_l4_csum;
+
+    /* PACKET_FANOUT */
+    int use_fanout;
+    int fanout_mode;      /* PACKET_FANOUT_HASH, _CPU, _LB, etc. */
+    int fanout_group;
+
+    /* RX mode */
+    int rx_mode;          /* 0=TX only, 1=RX only, 2=TX+RX */
+    char rx_interface[IFNAMSIZ];
+
+    /* CPU affinity */
+    int use_affinity;
 } config_t;
+
+/* RX statistics */
+typedef struct {
+    atomic_uint_fast64_t packets_recv;
+    atomic_uint_fast64_t bytes_recv;
+    atomic_uint_fast64_t packets_dropped;
+    atomic_uint_fast64_t seq_errors;      /* Out of order / missing */
+    uint32_t last_seq;
+} rx_stats_t;
 
 /* Worker statistics */
 typedef struct {
@@ -233,8 +272,10 @@ typedef struct {
 static volatile sig_atomic_t g_running = 1;
 static config_t g_config;
 static worker_stats_t g_stats[MAX_WORKERS];
+static rx_stats_t g_rx_stats;
 static pthread_t g_workers[MAX_WORKERS];
 static pthread_t g_stats_thread;
+static pthread_t g_rx_thread;
 static struct timespec g_start_time;
 static token_bucket_t g_bucket;
 static FILE *g_stats_fp = NULL;
@@ -730,6 +771,14 @@ static void *worker_thread(void *arg) {
         }
     }
 
+    /* CPU affinity (apply early) */
+    if (cfg->use_affinity) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(ctx->id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    }
+
     int ifindex = get_if_index(cfg->interface);
     if (ifindex < 0) {
         fprintf(stderr, "Failed to get interface index\n");
@@ -750,6 +799,17 @@ static void *worker_thread(void *arg) {
     }
 
     ctx->socket_fd = sock;
+
+    /* PACKET_FANOUT for multi-queue distribution (after bind) */
+    if (cfg->use_fanout) {
+        int fanout_arg = (cfg->fanout_group & 0xFFFF) | (cfg->fanout_mode << 16);
+        if (setsockopt(sock, SOL_PACKET, PACKET_FANOUT, &fanout_arg, sizeof(fanout_arg)) < 0) {
+            /* Non-fatal: some NICs don't support fanout */
+            if (ctx->id == 0 && cfg->verbose) {
+                fprintf(stderr, "Warning: PACKET_FANOUT not supported on this interface\n");
+            }
+        }
+    }
 
     /* Pre-allocate packets */
     int batch = cfg->batch_size;
@@ -861,6 +921,103 @@ static void *worker_thread(void *arg) {
 }
 
 /*============================================================================
+ * RX Thread (Receive Statistics)
+ *============================================================================*/
+
+static void *rx_thread(void *arg) {
+    config_t *cfg = (config_t *)arg;
+
+    const char *iface = strlen(cfg->rx_interface) > 0 ? cfg->rx_interface : cfg->interface;
+
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sock < 0) {
+        perror("RX socket");
+        return NULL;
+    }
+
+    int rcvbuf = 64 * 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    int ifindex = get_if_index(iface);
+    if (ifindex < 0) {
+        fprintf(stderr, "RX: Failed to get interface index for %s\n", iface);
+        close(sock);
+        return NULL;
+    }
+
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = ifindex;
+    sll.sll_protocol = htons(ETH_P_ALL);
+
+    if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        perror("RX bind");
+        close(sock);
+        return NULL;
+    }
+
+    /* Set promiscuous mode */
+    struct packet_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.mr_ifindex = ifindex;
+    mreq.mr_type = PACKET_MR_PROMISC;
+    setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+
+    uint8_t buf[MAX_PACKET_SIZE];
+    uint64_t local_packets = 0;
+    uint64_t local_bytes = 0;
+    struct timespec last_update;
+    clock_gettime(CLOCK_MONOTONIC, &last_update);
+
+    while (g_running) {
+        ssize_t len = recv(sock, buf, sizeof(buf), 0);
+        if (len > 0) {
+            local_packets++;
+            local_bytes += len;
+
+            /* Check sequence number if present (first 4 bytes of UDP payload) */
+            if (cfg->add_seq_num && len >= 46) {
+                /* Skip Eth(14) + IP(20) + UDP(8) = 42, or with VLAN: 46 */
+                uint32_t seq;
+                int offset = 14;  /* Ethernet header */
+                if (buf[12] == 0x81 && buf[13] == 0x00) {
+                    offset += 4;  /* VLAN tag */
+                }
+                offset += 20 + 8;  /* IP + UDP */
+                if (len > offset + 4) {
+                    memcpy(&seq, buf + offset, 4);
+                    seq = ntohl(seq);
+                    if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
+                        atomic_fetch_add(&g_rx_stats.seq_errors, 1);
+                    }
+                    g_rx_stats.last_seq = seq;
+                }
+            }
+
+            /* Periodic stats update */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double ms = (now.tv_sec - last_update.tv_sec) * 1000.0 +
+                       (now.tv_nsec - last_update.tv_nsec) / 1e6;
+            if (ms >= 100) {
+                atomic_fetch_add(&g_rx_stats.packets_recv, local_packets);
+                atomic_fetch_add(&g_rx_stats.bytes_recv, local_bytes);
+                local_packets = 0;
+                local_bytes = 0;
+                last_update = now;
+            }
+        }
+    }
+
+    atomic_fetch_add(&g_rx_stats.packets_recv, local_packets);
+    atomic_fetch_add(&g_rx_stats.bytes_recv, local_bytes);
+
+    close(sock);
+    return NULL;
+}
+
+/*============================================================================
  * Statistics Thread
  *============================================================================*/
 
@@ -869,18 +1026,28 @@ static void *stats_thread(void *arg) {
 
     if (!cfg->quiet) {
         printf("\n");
-        printf("════════════════════════════════════════════════════════════════════════════════\n");
+        printf("════════════════════════════════════════════════════════════════════════════════════════════\n");
         printf(" trafgen v%s - High-Performance Traffic Generator\n", VERSION);
-        printf(" %d workers, %d byte packets, batch %d, rate: %s\n",
+        printf(" %d workers, %d byte packets, batch %d, rate: %s",
                cfg->num_workers, cfg->packet_size, cfg->batch_size,
                cfg->rate_mbps > 0 ? "" : "unlimited");
-        if (cfg->rate_mbps > 0) printf("%.0f Mbps\n", cfg->rate_mbps);
-        printf("════════════════════════════════════════════════════════════════════════════════\n");
-        printf(" %8s │ %14s │ %12s │ %15s │ %10s\n",
-               "Time", "Packets", "Rate (pps)", "Throughput", "Errors");
-        printf("──────────┼────────────────┼──────────────┼─────────────────┼────────────\n");
+        if (cfg->rate_mbps > 0) printf("%.0f Mbps", cfg->rate_mbps);
+        if (cfg->rx_mode) printf(" | RX: %s",
+            strlen(cfg->rx_interface) > 0 ? cfg->rx_interface : cfg->interface);
+        printf("\n");
+        printf("════════════════════════════════════════════════════════════════════════════════════════════\n");
+        if (cfg->rx_mode) {
+            printf(" %8s │ %12s │ %10s │ %12s │ %12s │ %10s │ %8s\n",
+                   "Time", "TX Pkts", "TX pps", "TX Mbps", "RX Pkts", "RX pps", "Loss");
+            printf("──────────┼──────────────┼────────────┼──────────────┼──────────────┼────────────┼──────────\n");
+        } else {
+            printf(" %8s │ %14s │ %12s │ %15s │ %10s\n",
+                   "Time", "Packets", "Rate (pps)", "Throughput", "Errors");
+            printf("──────────┼────────────────┼──────────────┼─────────────────┼────────────\n");
+        }
     }
 
+    uint64_t last_rx_packets = 0;
     uint64_t last_packets = 0;
     uint64_t last_bytes = 0;
     struct timespec last_time;
@@ -914,15 +1081,34 @@ static void *stats_thread(void *arg) {
         double throughput_gbps = throughput_mbps / 1000.0;
 
         if (!cfg->quiet) {
-            char tp_str[32];
-            if (throughput_gbps >= 1.0) {
-                snprintf(tp_str, sizeof(tp_str), "%.2f Gbps", throughput_gbps);
-            } else {
-                snprintf(tp_str, sizeof(tp_str), "%.1f Mbps", throughput_mbps);
-            }
+            if (cfg->rx_mode) {
+                /* TX + RX stats */
+                uint64_t rx_packets = atomic_load(&g_rx_stats.packets_recv);
+                uint64_t delta_rx = rx_packets - last_rx_packets;
+                double rx_pps = delta_rx / interval;
 
-            printf(" %7.1fs │ %14lu │ %12.0f │ %15s │ %10lu\n",
-                   elapsed, total_packets, pps, tp_str, total_errors);
+                /* Calculate loss */
+                double loss_pct = 0.0;
+                if (total_packets > 0) {
+                    loss_pct = 100.0 * (1.0 - (double)rx_packets / (double)total_packets);
+                    if (loss_pct < 0) loss_pct = 0;
+                }
+
+                printf(" %7.1fs │ %12lu │ %10.0f │ %10.1f │ %12lu │ %10.0f │ %7.2f%%\n",
+                       elapsed, total_packets, pps, throughput_mbps,
+                       rx_packets, rx_pps, loss_pct);
+                last_rx_packets = rx_packets;
+            } else {
+                char tp_str[32];
+                if (throughput_gbps >= 1.0) {
+                    snprintf(tp_str, sizeof(tp_str), "%.2f Gbps", throughput_gbps);
+                } else {
+                    snprintf(tp_str, sizeof(tp_str), "%.1f Mbps", throughput_mbps);
+                }
+
+                printf(" %7.1fs │ %14lu │ %12.0f │ %15s │ %10lu\n",
+                       elapsed, total_packets, pps, tp_str, total_errors);
+            }
             fflush(stdout);
         }
 
@@ -960,15 +1146,34 @@ static void *stats_thread(void *arg) {
     }
 
     if (!cfg->quiet) {
-        printf("──────────┴────────────────┴──────────────┴─────────────────┴────────────\n\n");
+        if (cfg->rx_mode) {
+            printf("──────────┴──────────────┴────────────┴──────────────┴──────────────┴────────────┴──────────\n\n");
+        } else {
+            printf("──────────┴────────────────┴──────────────┴─────────────────┴────────────\n\n");
+        }
         printf("Summary:\n");
         printf("  Duration:       %.2f seconds\n", total_time);
-        printf("  Total Packets:  %lu\n", total_packets);
-        printf("  Total Data:     %.3f GB\n", total_bytes / (1024.0 * 1024.0 * 1024.0));
-        printf("  Avg Rate:       %.0f pps\n", total_packets / total_time);
-        printf("  Avg Throughput: %.3f Gbps\n", (total_bytes * 8.0) / (total_time * 1e9));
-        printf("  Errors:         %lu\n", total_errors);
-        printf("════════════════════════════════════════════════════════════════════════════════\n");
+        printf("  TX Packets:     %lu\n", total_packets);
+        printf("  TX Data:        %.3f GB\n", total_bytes / (1024.0 * 1024.0 * 1024.0));
+        printf("  TX Avg Rate:    %.0f pps\n", total_packets / total_time);
+        printf("  TX Throughput:  %.3f Gbps\n", (total_bytes * 8.0) / (total_time * 1e9));
+        printf("  TX Errors:      %lu\n", total_errors);
+        if (cfg->rx_mode) {
+            uint64_t rx_packets = atomic_load(&g_rx_stats.packets_recv);
+            uint64_t rx_bytes = atomic_load(&g_rx_stats.bytes_recv);
+            uint64_t seq_errors = atomic_load(&g_rx_stats.seq_errors);
+            double loss_pct = total_packets > 0 ?
+                100.0 * (1.0 - (double)rx_packets / (double)total_packets) : 0.0;
+            if (loss_pct < 0) loss_pct = 0;
+            printf("  ────────────────────────\n");
+            printf("  RX Packets:     %lu\n", rx_packets);
+            printf("  RX Data:        %.3f GB\n", rx_bytes / (1024.0 * 1024.0 * 1024.0));
+            printf("  RX Avg Rate:    %.0f pps\n", rx_packets / total_time);
+            printf("  RX Throughput:  %.3f Gbps\n", (rx_bytes * 8.0) / (total_time * 1e9));
+            printf("  Seq Errors:     %lu\n", seq_errors);
+            printf("  Packet Loss:    %.2f%%\n", loss_pct);
+        }
+        printf("════════════════════════════════════════════════════════════════════════════════════════════\n");
     }
 
     return NULL;
@@ -1025,6 +1230,14 @@ static void print_usage(const char *prog) {
     printf("  --multi-tc TC_SPEC[:VLAN]  Send to multiple TCs simultaneously\n");
     printf("                           TC_SPEC: 0-7, 0,2,4,6, or 0-3,6-7\n");
     printf("                           Example: --multi-tc 0-7:100\n");
+    printf("\n");
+    printf("Performance:\n");
+    printf("  --fanout[=MODE]          PACKET_FANOUT for multi-queue (hash,lb,cpu,rnd)\n");
+    printf("  --affinity               Pin worker threads to CPU cores\n");
+    printf("\n");
+    printf("RX Statistics:\n");
+    printf("  -R, --rx[=IFACE]         Enable RX stats (default: same as TX interface)\n");
+    printf("                           Measures received packets and calculates loss\n");
     printf("\n");
     printf("Packet:\n");
     printf("  -l, --length SIZE|MIN-MAX  Packet size (fixed or random range)\n");
@@ -1230,6 +1443,9 @@ int main(int argc, char *argv[]) {
         {"tcp-win",       required_argument, 0, 1011},
         {"skb-priority",  required_argument, 0, 1015},
         {"multi-tc",      required_argument, 0, 1017},
+        {"fanout",        optional_argument, 0, 1018},
+        {"affinity",      no_argument,       0, 1019},
+        {"rx",            optional_argument, 0, 'R'},
         {"df",            no_argument,       0, 1020},
         {"seq",           no_argument,       0, 1021},
         {"timestamp",     no_argument,       0, 1022},
@@ -1244,7 +1460,7 @@ int main(int argc, char *argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "a:b:A:B:c:d:l:p:P:Q:r:t:D:T:w:qvSh",
+    while ((opt = getopt_long(argc, argv, "a:b:A:B:c:d:l:p:P:Q:r:R::t:D:T:w:qvSh",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'a':
@@ -1395,6 +1611,34 @@ int main(int argc, char *argv[]) {
                         *colon = '\0';
                     }
                     parse_multi_tc(optarg, &g_config);
+                }
+                break;
+            case 1018:
+                /* --fanout[=MODE] where MODE: hash, lb, cpu, rnd */
+                g_config.use_fanout = 1;
+                g_config.fanout_group = getpid() & 0xFFFF;
+                if (optarg) {
+                    if (strcmp(optarg, "hash") == 0)
+                        g_config.fanout_mode = PACKET_FANOUT_HASH;
+                    else if (strcmp(optarg, "lb") == 0)
+                        g_config.fanout_mode = PACKET_FANOUT_LB;
+                    else if (strcmp(optarg, "cpu") == 0)
+                        g_config.fanout_mode = PACKET_FANOUT_CPU;
+                    else if (strcmp(optarg, "rnd") == 0)
+                        g_config.fanout_mode = PACKET_FANOUT_RND;
+                    else
+                        g_config.fanout_mode = PACKET_FANOUT_HASH;
+                } else {
+                    g_config.fanout_mode = PACKET_FANOUT_CPU;
+                }
+                break;
+            case 1019:
+                g_config.use_affinity = 1;
+                break;
+            case 'R':
+                g_config.rx_mode = 1;
+                if (optarg) {
+                    strncpy(g_config.rx_interface, optarg, IFNAMSIZ - 1);
                 }
                 break;
             case 1020: g_config.df_flag = 1; break;
@@ -1590,11 +1834,21 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Start RX thread if enabled */
+    if (g_config.rx_mode) {
+        memset(&g_rx_stats, 0, sizeof(g_rx_stats));
+        pthread_create(&g_rx_thread, NULL, rx_thread, &g_config);
+    }
+
     pthread_create(&g_stats_thread, NULL, stats_thread, &g_config);
     pthread_join(g_stats_thread, NULL);
 
     for (int i = 0; i < g_config.num_workers; i++) {
         pthread_join(g_workers[i], NULL);
+    }
+
+    if (g_config.rx_mode) {
+        pthread_join(g_rx_thread, NULL);
     }
 
     if (g_stats_fp) fclose(g_stats_fp);
