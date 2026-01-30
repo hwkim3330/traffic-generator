@@ -39,7 +39,38 @@
 #include <linux/if_ether.h>
 #include <sched.h>
 
-#include "tsn_payload.h"
+/*============================================================================
+ * TSN Payload Header (inline)
+ *============================================================================*/
+#define TSN_PAYLOAD_MAGIC       0x54534E31
+#define TSN_PAYLOAD_VERSION     1
+#define TSN_PAYLOAD_HDR_SIZE    24
+#define TSN_LEGACY_HDR_SIZE     12
+#define TSN_FLAG_SEQ            0x01
+#define TSN_FLAG_TIMESTAMP      0x02
+#define TSN_FLAG_FLOW_ID        0x04
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint8_t  flow_id;
+    uint8_t  reserved;
+    uint32_t seq_num;
+    uint64_t timestamp;
+    uint32_t payload_len;
+} tsn_payload_hdr_t;
+#pragma pack(pop)
+
+#define TSN_HDR_HAS_SEQ(hdr)       ((hdr)->flags & TSN_FLAG_SEQ)
+#define TSN_HDR_HAS_TIMESTAMP(hdr) ((hdr)->flags & TSN_FLAG_TIMESTAMP)
+#define TSN_HDR_HAS_FLOW_ID(hdr)   ((hdr)->flags & TSN_FLAG_FLOW_ID)
+
+static inline int tsn_is_new_format(const void *payload, size_t len) {
+    if (len < sizeof(uint32_t)) return 0;
+    return (*(const uint32_t *)payload == htonl(TSN_PAYLOAD_MAGIC));
+}
 
 /* SO_RXQ_OVFL for drop detection (if not defined) */
 #ifndef SO_RXQ_OVFL
@@ -194,7 +225,7 @@ static int get_if_index(const char *ifname) {
  * New format (v1, 24 bytes): Magic + version + flags + flow_id + seq + timestamp + len
  * Legacy format (12 bytes): seq (4) + timestamp (8)
  *
- * Use tsn_payload.h for header definitions.
+ * TSN payload header definitions are inlined above.
  */
 typedef struct {
     uint8_t src_mac[6];

@@ -50,7 +50,43 @@
 #include <linux/if_ether.h>
 #include <sched.h>
 
-#include "tsn_payload.h"
+/*============================================================================
+ * TSN Payload Header (inline)
+ *============================================================================*/
+#define TSN_PAYLOAD_VERSION     1
+#define TSN_PAYLOAD_MAGIC       0x54534E31  /* "TSN1" */
+#define TSN_PAYLOAD_HDR_SIZE    24
+#define TSN_FLAG_SEQ            0x01
+#define TSN_FLAG_TIMESTAMP      0x02
+#define TSN_FLAG_FLOW_ID        0x04
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint8_t  flow_id;
+    uint8_t  reserved;
+    uint32_t seq_num;
+    uint64_t timestamp;
+    uint32_t payload_len;
+} tsn_payload_hdr_t;
+#pragma pack(pop)
+
+#define TSN_HDR_HAS_SEQ(hdr)       ((hdr)->flags & TSN_FLAG_SEQ)
+
+static inline uint8_t tsn_encode_flow_id(uint8_t tc, uint8_t worker_id) {
+    return (uint8_t)((tc & 0x07) << 4) | (worker_id & 0x0F);
+}
+
+static inline uint32_t tsn_seq_start(uint8_t tc, uint8_t worker_id) {
+    return ((uint32_t)(tc & 0x07) << 28) | ((uint32_t)(worker_id & 0x0F) << 24);
+}
+
+static inline int tsn_is_new_format(const void *payload, size_t len) {
+    if (len < sizeof(uint32_t)) return 0;
+    return (*(const uint32_t *)payload == htonl(TSN_PAYLOAD_MAGIC));
+}
 
 /* PACKET_FANOUT definitions (if not provided by system headers) */
 #ifndef PACKET_FANOUT
