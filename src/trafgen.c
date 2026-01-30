@@ -1,5 +1,5 @@
 /*
- * trafgen - High-Performance Traffic Generator v1.2.1
+ * trafgen - High-Performance Traffic Generator v1.3.0
  * Based on Mausezahn concepts, enhanced with modern Linux networking features
  *
  * Copyright (C) 2025
@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -52,7 +53,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.2.1"
+#define VERSION "1.3.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
@@ -112,6 +113,11 @@ typedef struct {
     /* Socket priority (for tc/qdisc integration) */
     int skb_priority;       /* SO_PRIORITY value */
     int use_skb_priority;
+
+    /* Multi-TC mode */
+    uint8_t multi_tc[8];    /* TC list to use */
+    int multi_tc_count;     /* Number of TCs */
+    uint16_t multi_tc_vlan; /* Base VLAN ID for multi-TC */
 
     /* Layer 3 */
     char src_ip[INET6_ADDRSTRLEN];
@@ -1016,6 +1022,9 @@ static void print_usage(const char *prog) {
     printf("  --delay-per-pkt          Apply delay per packet (default: per batch)\n");
     printf("  --skb-priority NUM       Socket priority (SO_PRIORITY for tc/qdisc)\n");
     printf("                           Maps to tc filter prio or pfifo_fast bands\n");
+    printf("  --multi-tc TC_SPEC[:VLAN]  Send to multiple TCs simultaneously\n");
+    printf("                           TC_SPEC: 0-7, 0,2,4,6, or 0-3,6-7\n");
+    printf("                           Example: --multi-tc 0-7:100\n");
     printf("\n");
     printf("Packet:\n");
     printf("  -l, --length SIZE|MIN-MAX  Packet size (fixed or random range)\n");
@@ -1112,6 +1121,35 @@ static int parse_tcp_flags(const char *str) {
     return flags;
 }
 
+/* Parse multi-TC specification: "0-7", "0,2,4,6", "0-3,6-7" */
+static int parse_multi_tc(const char *str, config_t *cfg) {
+    cfg->multi_tc_count = 0;
+    char buf[64];
+    strncpy(buf, str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *token = strtok(buf, ",");
+    while (token && cfg->multi_tc_count < 8) {
+        char *dash = strchr(token, '-');
+        if (dash) {
+            int start = atoi(token);
+            int end = atoi(dash + 1);
+            for (int tc = start; tc <= end && cfg->multi_tc_count < 8; tc++) {
+                if (tc >= 0 && tc <= 7) {
+                    cfg->multi_tc[cfg->multi_tc_count++] = (uint8_t)tc;
+                }
+            }
+        } else {
+            int tc = atoi(token);
+            if (tc >= 0 && tc <= 7) {
+                cfg->multi_tc[cfg->multi_tc_count++] = (uint8_t)tc;
+            }
+        }
+        token = strtok(NULL, ",");
+    }
+    return cfg->multi_tc_count;
+}
+
 static int parse_vlan(const char *str, config_t *cfg) {
     if (cfg->vlan_count >= 8) return -1;
 
@@ -1191,6 +1229,7 @@ int main(int argc, char *argv[]) {
         {"tcp-ack",       required_argument, 0, 1010},
         {"tcp-win",       required_argument, 0, 1011},
         {"skb-priority",  required_argument, 0, 1015},
+        {"multi-tc",      required_argument, 0, 1017},
         {"df",            no_argument,       0, 1020},
         {"seq",           no_argument,       0, 1021},
         {"timestamp",     no_argument,       0, 1022},
@@ -1347,6 +1386,17 @@ int main(int argc, char *argv[]) {
                 g_config.use_skb_priority = 1;
                 break;
             case 1016: g_config.delay_per_packet = 1; break;
+            case 1017:
+                {
+                    /* Format: TC_SPEC[:VLAN] e.g., "0-7:100" or "0,2,4,6:100" */
+                    char *colon = strchr(optarg, ':');
+                    if (colon) {
+                        g_config.multi_tc_vlan = atoi(colon + 1) & 0xfff;
+                        *colon = '\0';
+                    }
+                    parse_multi_tc(optarg, &g_config);
+                }
+                break;
             case 1020: g_config.df_flag = 1; break;
             case 1021: g_config.add_seq_num = 1; break;
             case 1022: g_config.add_timestamp = 1; break;
@@ -1396,8 +1446,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Print config */
-    if (!g_config.quiet) {
+    /* Print config (skip if multi-TC mode, handled separately) */
+    if (!g_config.quiet && g_config.multi_tc_count <= 1) {
         printf("\nConfiguration:\n");
         printf("  Interface:    %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
                g_config.interface,
@@ -1460,6 +1510,65 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     memset(g_stats, 0, sizeof(g_stats));
+
+    /* Multi-TC mode: fork process for each TC */
+    if (g_config.multi_tc_count > 1) {
+        pid_t pids[8];
+        int num_tc = g_config.multi_tc_count;
+        int is_parent = 1;
+
+        if (!g_config.quiet) {
+            printf("\n══════════════════════════════════════════════════════════════════════════════\n");
+            printf(" Multi-TC Mode: %d Traffic Classes (PCP 0-%d)\n", num_tc, num_tc - 1);
+            printf(" VLAN: %d | Rate: %.0f Mbps/TC | Duration: %d sec\n",
+                   g_config.multi_tc_vlan,
+                   g_config.rate_mbps > 0 ? g_config.rate_mbps : 0,
+                   g_config.duration);
+            printf("══════════════════════════════════════════════════════════════════════════════\n");
+            fflush(stdout);
+        }
+
+        for (int i = 0; i < num_tc; i++) {
+            pids[i] = fork();
+            if (pids[i] == 0) {
+                /* Child process: configure for this TC */
+                is_parent = 0;
+                uint8_t tc = g_config.multi_tc[i];
+
+                /* Set VLAN with PCP = TC */
+                g_config.vlan_count = 1;
+                g_config.vlan_id[0] = g_config.multi_tc_vlan;
+                g_config.vlan_prio[0] = tc;
+                g_config.vlan_dei[0] = 0;
+
+                /* Set SKB priority */
+                g_config.skb_priority = tc;
+                g_config.use_skb_priority = 1;
+
+                /* Clear multi-TC to prevent recursion */
+                g_config.multi_tc_count = 0;
+
+                /* Quiet mode for children */
+                g_config.quiet = 1;
+
+                /* Continue to normal execution */
+                break;
+            } else if (pids[i] < 0) {
+                perror("fork");
+                return 1;
+            }
+        }
+
+        /* Parent: wait for all children */
+        if (is_parent) {
+            for (int i = 0; i < num_tc; i++) {
+                int status;
+                waitpid(pids[i], &status, 0);
+            }
+            printf("\nAll %d TCs completed.\n", num_tc);
+            return 0;
+        }
+    }
 
     token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.batch_size, g_config.packet_size);
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
