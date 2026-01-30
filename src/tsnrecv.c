@@ -1,5 +1,5 @@
 /*
- * tsnrecv - High-Performance TSN Traffic Receiver v1.1.0
+ * tsnrecv - High-Performance TSN Traffic Receiver v1.2.0
  * Companion tool for tsngen - measures TSN traffic characteristics
  *
  * Copyright (C) 2025
@@ -48,7 +48,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_BATCH_SIZE 256
 #define STATS_INTERVAL_US 1000000
@@ -557,26 +557,29 @@ static void *stats_thread(void *arg) {
 
         /* Write to CSV - standardized schema */
         if (g_csv_fp) {
-            /* Latency stats */
-            uint64_t lat_min = g_stats.latency_min;
-            uint64_t lat_max = g_stats.latency_max;
-            double lat_avg = g_stats.latency_count > 0 ?
-                (double)g_stats.latency_sum / g_stats.latency_count : 0;
-
-            /* IAT stats */
-            uint64_t iat_min = g_stats.iat_min;
-            uint64_t iat_max = g_stats.iat_max;
-            double iat_avg = g_stats.iat_count > 0 ?
-                (double)g_stats.iat_sum / g_stats.iat_count : 0;
-
             fprintf(g_csv_fp, "%.3f,%lu,%.0f,%.3f,%lu",
                     elapsed, total_packets, pps, mbps, kernel_drops);
             for (int p = 0; p < MAX_PCP; p++) {
                 fprintf(g_csv_fp, ",%lu", atomic_load(&g_stats.pcp[p].packets));
             }
-            fprintf(g_csv_fp, ",%lu,%.0f,%lu,%lu,%.0f,%lu\n",
-                    lat_min, lat_avg, lat_max,
-                    iat_min, iat_avg, iat_max);
+
+            /* Latency: -1 if not measured or no data */
+            if (cfg->measure_latency && g_stats.latency_count > 0) {
+                double lat_avg = (double)g_stats.latency_sum / g_stats.latency_count;
+                fprintf(g_csv_fp, ",%lu,%.0f,%lu",
+                        g_stats.latency_min, lat_avg, g_stats.latency_max);
+            } else {
+                fprintf(g_csv_fp, ",-1,-1,-1");
+            }
+
+            /* IAT: -1 if no data */
+            if (g_stats.iat_count > 0) {
+                double iat_avg = (double)g_stats.iat_sum / g_stats.iat_count;
+                fprintf(g_csv_fp, ",%lu,%.0f,%lu\n",
+                        g_stats.iat_min, iat_avg, g_stats.iat_max);
+            } else {
+                fprintf(g_csv_fp, ",-1,-1,-1\n");
+            }
             fflush(g_csv_fp);
         }
 
@@ -657,6 +660,9 @@ static void *stats_thread(void *arg) {
         if (cfg->measure_latency && g_stats.latency_count > 0) {
             double avg_lat = (double)g_stats.latency_sum / g_stats.latency_count / 1000.0;
             printf("\n  Latency (us) [CLOCK_MONOTONIC_RAW]:\n");
+            if (kernel_drops > 0) {
+                printf("    ⚠ WARNING: drops > 0, latency may be inflated by RX backlog\n");
+            }
             printf("    Min: %.1f\n", g_stats.latency_min / 1000.0);
             printf("    Avg: %.1f\n", avg_lat);
             printf("    Max: %.1f\n", g_stats.latency_max / 1000.0);

@@ -71,7 +71,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.5.0"
+#define VERSION "1.6.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
@@ -137,6 +137,7 @@ typedef struct {
     int multi_tc_count;     /* Number of TCs */
     uint16_t multi_tc_vlan; /* Base VLAN ID for multi-TC */
     int rate_per_tc;        /* 1 = rate is per TC, 0 = rate is total (split across TCs) */
+    uint64_t tc_seq_offset; /* Sequence offset for this TC (set by fork) */
 
     /* Layer 3 */
     char src_ip[INET6_ADDRSTRLEN];
@@ -1815,6 +1816,14 @@ int main(int argc, char *argv[]) {
                 /* Clear multi-TC to prevent recursion */
                 g_config.multi_tc_count = 0;
 
+                /*
+                 * Sequence offset per TC:
+                 * Each TC gets a unique base offset to avoid sequence collision.
+                 * TC0: 0-99M, TC1: 100M-199M, TC2: 200M-299M, etc.
+                 * Within each TC, workers get their own sub-offset.
+                 */
+                g_config.tc_seq_offset = (uint64_t)i * 100000000ULL;
+
                 /* Quiet mode for children */
                 g_config.quiet = 1;
 
@@ -1848,7 +1857,8 @@ int main(int argc, char *argv[]) {
         contexts[i].cfg = &g_config;
         contexts[i].stats = &g_stats[i];
         contexts[i].bucket = &g_bucket;
-        contexts[i].seq_num = i * 1000000;
+        /* Sequence: tc_seq_offset + (worker_id * 1M) to avoid collision */
+        contexts[i].seq_num = g_config.tc_seq_offset + (uint32_t)(i * 1000000);
 
         if (pthread_create(&g_workers[i], NULL, worker_thread, &contexts[i]) != 0) {
             fprintf(stderr, "Failed to create worker %d\n", i);

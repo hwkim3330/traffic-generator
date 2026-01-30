@@ -11,7 +11,7 @@
 
 ## 주요 기능
 
-### tsngen (TX) v1.5.0
+### tsngen (TX) v1.6.0
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
 - **Multi-TC 모드** - 8개 TC 동시 전송
 - **VLAN PCP/DEI** 지원
@@ -21,7 +21,7 @@
 - **패킷간 딜레이** (ns/us/ms 정밀도)
 - **CLOCK_MONOTONIC_RAW** 타임스탬프
 
-### tsnrecv (RX) v1.1.0
+### tsnrecv (RX) v1.2.0
 - **recvmmsg** 고속 배치 수신
 - **SO_RXQ_OVFL** - 커널 드롭 감지
 - **PCP별 실시간 통계** - CBS/TAS 검증
@@ -277,15 +277,31 @@ sudo ./tsnrecv eth0 --affinity=2 ...
 sudo ./tsnrecv eth0 --batch 512 ...
 ```
 
-## 한계
+## 한계 및 주의사항
 
-- **64B 패킷 고PPS**: RX도 튜닝 필요 (affinity, batch, sysctl)
+### 성능 한계
+- **64B 패킷 고PPS**: RX 병목 발생 가능 (affinity, batch, sysctl 필수)
+- **RX 단일 스레드**: 수백 kpps 이상은 drop 확인 필수
+
+### 측정 정확도
 - **Cross-machine 지연**: 동일 머신에서만 정확 (PTP 미사용)
-- **Multi-TC fork**: 각 TC가 별도 프로세스로 동작
+- **Drops > 0 시 Latency**: RX backlog로 인한 latency 왜곡 가능 (경고 출력)
+- **Multi-TC fork 구조**: TC간 미세 jitter 발생 가능 (커널 스케줄링 영향)
+
+### 시퀀스 추적
+- **Multi-worker 모드**: 동일 PCP에 여러 worker가 다른 seq offset 사용
+  - RX에서 interleaved sequences로 보임 → false reorder 가능
+  - 정확한 seq 추적이 필요하면 `-w 1` 사용 권장
+- **Multi-TC 모드**: TC별 100M offset으로 시퀀스 분리됨 (v1.6.0+)
+
+### CSV 처리
+- **Latency/IAT 비활성 시**: `-1` 출력 (0이 아님)
+- **후처리 시 -1 값 필터링 필요**
 
 ## 버전 히스토리
 
 ### tsngen
+- v1.6.0: Multi-TC 시퀀스 충돌 수정 (TC별 100M offset)
 - v1.5.0: CLOCK_MONOTONIC_RAW, --rate-per-tc 옵션
 - v1.4.0: PACKET_FANOUT, CPU Affinity, RX 통계
 - v1.3.0: Multi-TC 모드
@@ -293,6 +309,7 @@ sudo ./tsnrecv eth0 --batch 512 ...
 - v1.0.0: 초기 버전
 
 ### tsnrecv
+- v1.2.0: Latency 경고 (drops>0), CSV -1 처리, 버그 수정
 - v1.1.0: SO_RXQ_OVFL 드롭 감지, CLOCK_MONOTONIC_RAW, per-PCP 시퀀스, CPU affinity, CSV 스키마 표준화
 - v1.0.0: 초기 버전 (recvmmsg, PCP 통계, 지연 분석)
 
