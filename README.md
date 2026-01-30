@@ -1,369 +1,92 @@
-# TSN Traffic Tools - tsngen & tsncap
+# Traffic Generator - txgen & rxcap
 
-고성능 TSN (Time-Sensitive Networking) 트래픽 생성 및 캡처 도구.
+고성능 패킷 생성 및 캡처 도구.
 
-## 도구 구성
+## 도구
 
 | 도구 | 용도 | 핵심 기능 |
 |------|------|----------|
-| **tsngen** | 트래픽 생성 (TX) | sendmmsg 배치 전송, Multi-TC, VLAN PCP, pcap 재생 |
-| **tsncap** | 트래픽 캡처 (RX) | recvmmsg 배치 수신, PCP별 통계, 지연 분석, pcap 저장 |
-
-## 주요 기능
-
-### tsngen (TX) v2.0.0
-- **10+ Gbps** 처리량 (sendmmsg 배치 전송)
-- **Multi-TC 모드** - 8개 TC 동시 전송
-- **VLAN PCP/DEI** 지원
-- **토큰 버킷** 정밀 레이트 제한
-- **--rate-per-tc** - Multi-TC 레이트 정책 명확화
-- **패킷간 딜레이** (ns/us/ms 정밀도)
-- **CLOCK_MONOTONIC_RAW** 타임스탬프
-- **pcap 재생** - `--replay` 옵션으로 pcap 파일 재생
-
-### tsncap (RX) v2.0.0
-- **recvmmsg** 고속 배치 수신
-- **SO_RXQ_OVFL** - 커널 드롭 감지
-- **PCP별 실시간 통계** - CBS/TAS 검증
-- **Per-flow 시퀀스 추적** - flow_id별 손실 분석
-- **VLAN/QinQ 필터링** - 특정 VLAN/PCP만 캡처
-- **지연 측정** - CLOCK_MONOTONIC_RAW 기반
-- **CPU Affinity** - RX 스레드 코어 고정
-- **표준화 CSV 스키마** - 자동화/후처리용
-- **pcap 저장** - `--pcap` 옵션으로 캡처 파일 저장
+| **txgen** | 패킷 생성 (TX) | sendmmsg 배치 전송, VLAN PCP, pcap 재생 |
+| **rxcap** | 패킷 캡처 (RX) | recvmmsg 배치 수신, 지연 분석, pcap 저장 |
 
 ## 설치
 
 ```bash
 make
-sudo make install  # 선택
+sudo make install  # /usr/local/bin/
 ```
 
 ## 빠른 시작
 
 ```bash
-# TX: 8개 TC 동시 전송 (100 Mbps/TC)
-sudo ./tsngen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 --multi-tc 0-7:100 -r 100 --rate-per-tc
+# TX: UDP 전송
+sudo ./txgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -r 100
 
-# RX: PCP별 통계 수집 (CPU 2 고정)
-sudo ./tsncap eth1 --vlan 100 --pcp-stats --affinity=2 --duration 60
+# RX: 캡처
+sudo ./rxcap eth1 --duration 60
 
-# 손실률/지연 측정
-sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 --seq --timestamp &
-sudo ./tsncap eth1 --vlan 100 --seq --latency --csv results.csv
+# TX: 시퀀스 + 타임스탬프
+sudo ./txgen eth0 -B IP -b MAC --seq --timestamp -r 500
+
+# RX: 지연 측정 + pcap 저장
+sudo ./rxcap eth1 --latency --pcap capture.pcap --duration 60
+
+# pcap 재생
+sudo ./txgen eth0 --replay capture.pcap
 ```
 
-## tsngen 옵션
+## txgen 주요 옵션
 
 ```
-Usage: tsngen [options] <interface>
+Usage: txgen [options] <interface>
 
 Required:
   -B, --dst-ip IP          목적지 IP
   -b, --dst-mac MAC        목적지 MAC
 
-Layer 2/3/4:
-  -Q, --vlan [PCP[.DEI]:]VLAN  VLAN 태그 (예: 6:100, 6.1:100)
-  -A, --src-ip IP|rand|IP-IP   소스 IP (범위 지원)
-  -D, --dscp VALUE         DSCP 0-63
-  -t, --type TYPE          udp, tcp, icmp, raw
-  -p, --port PORT|PORT-PORT    포트 (범위 지원)
-
-Traffic Control:
+Traffic:
   -r, --rate MBPS          속도 제한
-  --rate-per-tc            Multi-TC에서 레이트는 TC당 (기본: 총합 분배)
-  --duration SEC           지속 시간
-  --multi-tc TC[:VLAN]     멀티 TC 모드 (예: 0-7:100)
-  -d, --delay DELAY        패킷간 딜레이 (100ns, 10us, 1ms)
-  --skb-priority NUM       SO_PRIORITY (tc 연동)
+  --duration SEC           전송 시간
+  -Q, --vlan [PCP:]VLAN    VLAN 태그
 
-Performance:
-  --affinity               CPU 코어 고정
-  --fanout[=MODE]          PACKET_FANOUT
-
-Packet:
-  --seq                    시퀀스 번호 삽입
-  --timestamp              타임스탬프 삽입 (CLOCK_MONOTONIC_RAW)
-  -l, --length SIZE|MIN-MAX    패킷 크기
-
-Output:
-  --stats-file FILE        CSV 통계 출력
-  -R, --rx[=IFACE]         RX 통계 (손실률)
+Payload:
+  --seq                    시퀀스 번호 (4 bytes)
+  --timestamp              타임스탬프 (8 bytes)
 
 Replay:
-  --replay FILE            pcap 파일 재생 (라인레이트)
+  --replay FILE            pcap 파일 재생
 ```
 
-## tsncap 옵션
+## rxcap 주요 옵션
 
 ```
-Usage: tsncap [options] <interface>
-
-Filter:
-  --vlan VID               VLAN ID 필터
-  --pcp NUM                PCP 필터 (0-7)
-  --tsn-only               TSN 헤더 있는 패킷만 캡처
+Usage: rxcap [options] <interface>
 
 Capture:
-  --duration SEC           캡처 시간 (0=무한)
-  --batch NUM              배치 크기 (기본: 256)
+  --duration SEC           캡처 시간
   --pcap FILE              pcap 파일로 저장
 
+Filter:
+  --vlan VID               VLAN 필터
+  --seq-only               시퀀스 헤더 있는 패킷만
+
 Analysis:
-  --seq                    시퀀스 추적 (per-flow_id)
-  --latency                지연 측정 (tsngen --timestamp 필요)
-  --pcp-stats              PCP별 통계 표시
-
-Performance:
-  --affinity[=CPU]         RX 스레드 CPU 고정 (기본: 0)
-
-Output:
-  --csv FILE               CSV 파일 출력 (표준화 스키마)
-  -q, --quiet              조용히 실행
+  --seq                    시퀀스 추적
+  --latency                지연 측정 (txgen --timestamp 필요)
 ```
 
-## 타임스탬프 정책
-
-- **Clock**: `CLOCK_MONOTONIC_RAW` (NTP 영향 없음)
-- **TX**: tsngen `--timestamp`로 payload에 ns 삽입
-- **RX**: tsncap `--latency`로 수신 시각과 비교
-- **제한**: TX/RX가 같은 머신에서 동작해야 정확한 지연 측정
-- **Cross-machine**: PTP 동기화된 HW 타임스탬프 사용 필요
-
-## Payload 헤더 (12 bytes)
-
-`--seq` 또는 `--timestamp` 사용 시 UDP payload 앞에 삽입:
+## Payload 포맷 (12 bytes)
 
 ```
-Bytes 0-3:  Sequence Number (network order, big-endian)
-Bytes 4-11: Timestamp (host order, nanoseconds)
+Bytes 0-3:  Sequence Number (network order)
+Bytes 4-11: Timestamp (nanoseconds, host order)
 ```
 
-- **--seq**: 시퀀스 번호 삽입 (4 bytes)
-- **--timestamp**: 타임스탬프 삽입 (8 bytes)
-- 둘 다 사용 시 총 12 bytes
+## 의존성
 
-## 드롭 감지
-
-tsncap은 `SO_RXQ_OVFL`을 사용하여 커널/소켓 드롭을 감지:
-
-```
-Summary:
-  Kernel Drops:   0 (SO_RXQ_OVFL)
-```
-
-- **Drops > 0**: 수신 병목 발생 (버퍼 부족, CPU 부족)
-- **해결**: `--affinity`, 소켓 버퍼 증가, 배치 크기 조정
-
-## CSV 스키마
-
-표준화된 CSV 컬럼 (자동화/후처리 호환):
-
-```
-time_s,total_pkts,total_pps,total_mbps,drops,
-pcp0_pkts,pcp1_pkts,pcp2_pkts,pcp3_pkts,pcp4_pkts,pcp5_pkts,pcp6_pkts,pcp7_pkts,
-latency_min_ns,latency_avg_ns,latency_max_ns,
-iat_min_ns,iat_avg_ns,iat_max_ns
-```
-
-## 사용 예제
-
-### 기본 트래픽 생성/수신
-
-```bash
-# TX: 1 Gbps UDP
-sudo ./tsngen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -r 1000
-
-# RX: 모든 트래픽 캡처
-sudo ./tsncap eth1 --duration 60
-```
-
-### Multi-TC TSN 테스트
-
-```bash
-# TX: 8개 TC 동시 전송 (각 TC 100 Mbps)
-sudo ./tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 -r 100 --rate-per-tc --seq --timestamp
-
-# RX: PCP별 통계 + per-PCP 시퀀스 추적
-sudo ./tsncap eth1 --vlan 100 --pcp-stats --seq --affinity=2 --csv results.csv
-```
-
-### CBS (Credit-Based Shaper) 검증
-
-```bash
-# TX: TC2=1.5Mbps, TC6=3.5Mbps 목표
-sudo ./tsngen eth0 -B IP -b MAC --multi-tc 2,6:100 -r 1500 --rate-per-tc &  # TC2
-sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 -r 3500 &  # TC6
-
-# RX: 실제 수신량 확인 (CBS가 목표대로 shaping 했는지)
-sudo ./tsncap eth1 --vlan 100 --pcp-stats --csv cbs_results.csv --duration 60
-```
-
-### TAS (Time-Aware Shaper) 검증
-
-```bash
-# TX: 모든 PCP 동시 전송 (gate pattern 확인용)
-sudo ./tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 -r 50 --rate-per-tc --seq --timestamp
-
-# RX: inter-arrival time으로 gate open 구간 확인
-sudo ./tsncap eth1 --vlan 100 --pcp-stats --latency --csv tas_results.csv
-```
-
-### 손실률/지연 측정
-
-```bash
-# TX: 시퀀스 + 타임스탬프
-sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 --seq --timestamp -r 500
-
-# RX: per-flow 시퀀스 분석 + 지연 측정
-sudo ./tsncap eth1 --vlan 100 --pcp 6 --seq --latency
-```
-
-### pcap 캡처 및 재생
-
-```bash
-# 캡처: pcap 파일로 저장
-sudo ./tsncap eth1 --pcap capture.pcap --duration 60
-
-# 캡처: TSN 트래픽만 저장
-sudo ./tsncap eth1 --pcap tsn_only.pcap --tsn-only --duration 60
-
-# 재생: pcap 파일 라인레이트로 재생
-sudo ./tsngen eth0 --replay capture.pcap
-
-# Wireshark로 분석
-wireshark capture.pcap
-```
-
-## 출력 예시
-
-### tsngen (Multi-TC)
-
-```
-══════════════════════════════════════════════════════════════════════════════
- Multi-TC Mode: 8 Traffic Classes (PCP 0-7)
- VLAN: 100 | Rate: 100 Mbps/TC | Duration: 10 sec
- Clock: CLOCK_MONOTONIC_RAW (for timestamp)
-══════════════════════════════════════════════════════════════════════════════
-
-All 8 TCs completed.
-```
-
-### tsncap (PCP 통계 + 드롭)
-
-```
-═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
- tsncap v2.0.0 - TSN Traffic Capture
- Interface: eth1 | Batch: 256 | VLAN: 100 | CPU: 2
- Clock: CLOCK_MONOTONIC_RAW (for latency measurement)
-═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
-    Time │      Packets │        PPS │       Mbps │  Drops │   PCP0    PCP1    PCP2    PCP3    PCP4    PCP5    PCP6    PCP7
-─────────┼──────────────┼────────────┼────────────┼────────┼───────────────────────────────────────────────────────────────────
-    1.0s │       672000 │     672000 │     7916.0 │      0 │   84000   84000   84000   84000   84000   84000   84000   84000
-─────────┴──────────────┴────────────┴────────────┴────────┴───────────────────────────────────────────────────────────────────
-
-Summary:
-  Duration:       1.00 seconds
-  Total Packets:  672000
-  Kernel Drops:   0 (SO_RXQ_OVFL)
-
-  PCP Distribution:
-    PCP 0: 84000 pkts (12.5%), 988.2 Mbps avg
-    PCP 6: 84000 pkts (12.5%), 988.2 Mbps avg [seq_err:0 dup:0]
-    ...
-
-  Latency (us) [CLOCK_MONOTONIC_RAW]:
-    Min: 12.3
-    Avg: 45.6
-    Max: 234.5
-═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
-```
-
-## TSN 실험 워크플로우
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   tsngen    │────▶│ TSN Switch  │────▶│   tsncap    │
-│    (TX)     │     │  CBS/TAS    │     │    (RX)     │
-└─────────────┘     └─────────────┘     └─────────────┘
-      │                                        │
-      │  --multi-tc 0-7:100                   │  --pcp-stats --seq
-      │  --seq --timestamp                    │  --latency --affinity
-      │  -r 100 --rate-per-tc                 │  --csv results.csv
-      │                                        │
-      └────────────────────────────────────────┘
-              실험 결과 정량화 (CSV)
-```
-
-## 성능 튜닝
-
-```bash
-# 소켓 버퍼 (드롭 방지)
-sudo sysctl -w net.core.wmem_max=67108864
-sudo sysctl -w net.core.rmem_max=67108864
-
-# NIC 링버퍼
-sudo ethtool -G eth0 tx 4096 rx 4096
-
-# CPU 고정 (RX 병목 방지)
-sudo ./tsncap eth0 --affinity=2 ...
-
-# 배치 크기 조정
-sudo ./tsncap eth0 --batch 512 ...
-```
-
-## 한계 및 주의사항
-
-### 성능 한계
-- **64B 패킷 고PPS**: RX 병목 발생 가능 (affinity, batch, sysctl 필수)
-- **RX 단일 스레드**: 수백 kpps 이상은 drop 확인 필수
-
-### 측정 정확도
-- **Cross-machine 지연**: 동일 머신에서만 정확 (PTP 미사용)
-- **Drops > 0 시 Latency**: RX backlog로 인한 latency 왜곡 가능 (경고 출력)
-- **Multi-TC fork 구조**: TC간 미세 jitter 발생 가능 (커널 스케줄링 영향)
-
-### 시퀀스 추적
-- **Multi-worker 모드**: 동일 PCP에 여러 worker가 다른 seq offset 사용
-  - RX에서 interleaved sequences로 보임 → false reorder 가능
-  - 정확한 seq 추적이 필요하면 `-w 1` 사용 권장
-- **Multi-TC 모드**: TC별 100M offset으로 시퀀스 분리됨 (v1.6.0+)
-
-### CSV 처리
-- **Latency/IAT 비활성 시**: `-1` 출력 (0이 아님)
-- **후처리 시 -1 값 필터링 필요**
-
-## 버전 히스토리
-
-### tsngen
-- v2.1.0: 단순 payload 헤더 (12B: seq+timestamp), 복잡한 TSN1 헤더 제거
-- v2.0.0: pcap 재생 기능 (`--replay`), libpcap 미의존
-- v1.8.x: 버그 수정들 (token bucket, checksum, thread-safe rand 등)
-- v1.8.2: SO_PRIORITY/PACKET_FANOUT 제거 (의존성 간소화)
-- v1.8.1: token_bucket g_running 체크, --pps 옵션 동작 수정
-- v1.8.0: 버그 수정 - L4 체크섬 payload 반영, seq_num 이중 증가 수정, rand() thread-safe 변경
-- v1.7.0: 표준 TSN payload 헤더 (24B), flow_id, --legacy-payload
-- v1.6.0: Multi-TC 시퀀스 충돌 수정 (TC별 offset)
-- v1.5.0: CLOCK_MONOTONIC_RAW, --rate-per-tc 옵션
-- v1.4.0: CPU Affinity, RX 통계
-- v1.3.0: Multi-TC 모드
-- v1.2.x: tc 연동, VLAN DEI, 딜레이
-- v1.0.0: 초기 버전
-
-### tsncap (구 tsnrecv)
-- v2.1.0: 단순 payload 헤더 파싱 (12B: seq+timestamp)
-- v2.0.0: tsnrecv → tsncap 이름 변경, pcap 저장 기능 (`--pcap`), `--tsn-only` 필터
-- v1.x: VLAN/QinQ 파서, 시퀀스 추적, 지연 측정
-- v1.2.0: Latency 경고 (drops>0), CSV -1 처리, 버그 수정
-- v1.1.0: SO_RXQ_OVFL 드롭 감지, CLOCK_MONOTONIC_RAW, per-PCP 시퀀스, CPU affinity, CSV 스키마 표준화
-- v1.0.0: 초기 버전 (recvmmsg, PCP 통계, 지연 분석)
+- 없음 (표준 C/POSIX만 사용)
+- libpcap 불필요
 
 ## 라이선스
 
 GPLv2
-
-## 참고
-
-- [Mausezahn (mz)](https://github.com/uweber/mausezahn)
-- [IEEE 802.1Qav (CBS)](https://standards.ieee.org/)
-- [IEEE 802.1Qbv (TAS)](https://standards.ieee.org/)

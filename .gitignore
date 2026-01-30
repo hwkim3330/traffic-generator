@@ -1,7 +1,6 @@
 # Compiled binaries
-tsngen
-tsncap
-tsnrecv
+txgen
+rxcap
 *.o
 *.a
 

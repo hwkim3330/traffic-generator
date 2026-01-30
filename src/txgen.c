@@ -1,5 +1,5 @@
 /*
- * tsngen - High-Performance Traffic Generator v1.4.0
+ * txgen - High-Performance Traffic Generator v1.4.0
  * Based on Mausezahn concepts, enhanced with modern Linux networking features
  *
  * Copyright (C) 2025
@@ -327,7 +327,7 @@ static void signal_handler(int sig) {
 /*
  * Timestamp policy:
  * - Uses CLOCK_MONOTONIC_RAW for timestamp (not subject to NTP)
- * - tsnrecv must also use CLOCK_MONOTONIC_RAW for accurate latency
+ * - rxcap must also use CLOCK_MONOTONIC_RAW for accurate latency
  * - For cross-machine latency, use PTP-synced HW timestamps
  */
 static inline uint64_t get_time_ns(void) {
@@ -1099,7 +1099,7 @@ static void *stats_thread(void *arg) {
     if (!cfg->quiet) {
         printf("\n");
         printf("════════════════════════════════════════════════════════════════════════════════════════════\n");
-        printf(" tsngen v%s - High-Performance Traffic Generator\n", VERSION);
+        printf(" txgen v%s - High-Performance Traffic Generator\n", VERSION);
         printf(" %d workers, %d byte packets, batch %d, rate: %s",
                cfg->num_workers, cfg->packet_size, cfg->batch_size,
                cfg->rate_mbps > 0 ? "" : "unlimited");
@@ -1257,7 +1257,7 @@ static void *stats_thread(void *arg) {
 
 static void print_usage(const char *prog) {
     printf("\n");
-    printf("tsngen v%s - High-Performance Traffic Generator\n", VERSION);
+    printf("txgen v%s - High-Performance Traffic Generator\n", VERSION);
     printf("\n");
     printf("Usage: %s [options] <interface>\n", prog);
     printf("\n");
@@ -1346,7 +1346,7 @@ static void print_usage(const char *prog) {
     printf("  # Random source IP, sequence numbers, stats to file\n");
     printf("  sudo %s eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -A rand --seq --stats-file stats.csv\n", prog);
     printf("\n");
-    printf("  # TSN/tc integration: VLAN PCP 6, SKB priority 6\n");
+    printf("  # tc integration: VLAN PCP 6, SKB priority 6\n");
     printf("  sudo %s eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 6:100 --skb-priority 6\n", prog);
     printf("\n");
     printf("  # CBS test: PCP 2 and PCP 6 traffic\n");
@@ -1794,7 +1794,7 @@ int main(int argc, char *argv[]) {
             case 'v': g_config.verbose = 1; break;
             case 'S': g_config.simulation = 1; break;
             case 'h': print_usage(argv[0]); return 0;
-            case 1000: printf("tsngen v%s\n", VERSION); return 0;
+            case 1000: printf("txgen v%s\n", VERSION); return 0;
             default: print_usage(argv[0]); return 1;
         }
     }

@@ -1,13 +1,13 @@
 /*
- * tsncap - TSN Traffic Capture & Analysis Tool
- * Companion tool for tsngen - captures and analyzes TSN traffic
+ * rxcap - Traffic Capture & Analysis Tool
+ * Companion tool for txgen
  *
  * Copyright (C) 2025
  *
  * Features:
  * - recvmmsg() batch receive for 10Gbps+ capture
  * - PCAP file output (Wireshark compatible)
- * - Per-PCP/TC statistics for TSN analysis
+ * - Per-PCP/TC statistics
  * - VLAN tag parsing (PCP, DEI, VID, QinQ)
  * - Latency and inter-arrival time measurement
  * - Sequence number tracking
@@ -120,7 +120,7 @@ typedef struct {
     uint16_t vlan_id;
     int filter_pcp;
     uint8_t pcp;
-    int tsn_only;   /* Only count packets with valid TSN header */
+    int seq_only;   /* Only count packets with sequence header */
 
     /* Options */
     int duration;
@@ -236,7 +236,7 @@ static void signal_handler(int sig) {
  * Timestamp policy:
  * - Uses CLOCK_MONOTONIC_RAW for latency measurement
  * - This clock is not subject to NTP adjustments
- * - tsngen must also use CLOCK_MONOTONIC_RAW for accurate latency
+ * - txgen must also use CLOCK_MONOTONIC_RAW for accurate latency
  * - For cross-machine latency, use PTP-synced HW timestamps instead
  */
 static inline uint64_t get_time_ns(void) {
@@ -315,7 +315,7 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     pkt->ethertype = ethertype;
     pkt->payload_offset = offset;
 
-    /* Try to extract TSN header from UDP payload */
+    /* Try to extract seq/timestamp from UDP payload */
     if (ethertype == 0x0800 && len >= offset + 20 + 8) {
         int ip_offset = offset;
         int ihl = (buf[ip_offset] & 0x0F) * 4;
@@ -472,7 +472,7 @@ static void *rx_thread(void *arg) {
                 if (cfg->filter_pcp && (!pkt.has_vlan || pkt.pcp != cfg->pcp)) {
                     continue;
                 }
-                if (cfg->tsn_only && !pkt.has_seq) {
+                if (cfg->seq_only && !pkt.has_seq) {
                     continue;  /* Skip packets without seq header */
                 }
 
@@ -581,7 +581,7 @@ static void *stats_thread(void *arg) {
     if (!cfg->quiet) {
         printf("\n");
         printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-        printf(" tsncap v%s - TSN Traffic Receiver\n", VERSION);
+        printf(" rxcap v%s - Traffic Capture\n", VERSION);
         printf(" Interface: %s | Batch: %d", cfg->interface, cfg->batch_size);
         if (cfg->filter_vlan) printf(" | VLAN: %d", cfg->vlan_id);
         if (cfg->filter_pcp) printf(" | PCP: %d", cfg->pcp);
@@ -791,8 +791,8 @@ static void *stats_thread(void *arg) {
 
 static void print_usage(const char *prog) {
     printf("\n");
-    printf("tsncap v%s - TSN Traffic Receiver\n", VERSION);
-    printf("Companion tool for tsngen - measures TSN traffic characteristics\n");
+    printf("rxcap v%s - Traffic Capture\n", VERSION);
+    printf("Companion tool for txgen - traffic capture & analysis\n");
     printf("\n");
     printf("Usage: %s [options] <interface>\n", prog);
     printf("\n");
@@ -806,8 +806,8 @@ static void print_usage(const char *prog) {
     printf("\n");
     printf("Analysis:\n");
     printf("  --seq                    Track sequence numbers\n");
-    printf("  --tsn-only               Only count packets with TSN header (filter noise)\n");
-    printf("  --latency                Measure latency (requires tsngen --timestamp)\n");
+    printf("  --seq-only               Only count packets with seq header (filter noise)\n");
+    printf("  --latency                Measure latency (requires txgen --timestamp)\n");
     printf("  --pcp-stats              Show per-PCP statistics\n");
     printf("\n");
     printf("Performance:\n");
@@ -823,7 +823,7 @@ static void print_usage(const char *prog) {
     printf("\n");
     printf("Clock Policy:\n");
     printf("  - Uses CLOCK_MONOTONIC_RAW for latency measurement\n");
-    printf("  - tsngen must also use --timestamp for latency to work\n");
+    printf("  - txgen must also use --timestamp for latency to work\n");
     printf("  - Both tools must run on the same machine for accurate latency\n");
     printf("\n");
     printf("Drop Detection:\n");
@@ -844,9 +844,9 @@ static void print_usage(const char *prog) {
     printf("  # Capture VLAN 100 traffic with PCP stats and CPU pinning\n");
     printf("  sudo %s eth0 --vlan 100 --pcp-stats --affinity=2\n", prog);
     printf("\n");
-    printf("  # Full TSN analysis with tsngen\n");
+    printf("  # Full analysis with txgen\n");
     printf("  # Terminal 1 (RX):  sudo %s eth1 --vlan 100 --seq --latency --pcp-stats --csv results.csv\n", prog);
-    printf("  # Terminal 2 (TX):  sudo tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 --seq --timestamp\n");
+    printf("  # Terminal 2 (TX):  sudo txgen eth0 -B IP -b MAC --multi-tc 0-7:100 --seq --timestamp\n");
     printf("\n");
 }
 
@@ -870,7 +870,7 @@ int main(int argc, char *argv[]) {
         {"csv",       required_argument, 0, 1008},
         {"pcap",      required_argument, 0, 1011},
         {"affinity",  optional_argument, 0, 1009},
-        {"tsn-only", no_argument,       0, 1010},
+        {"seq-only", no_argument,       0, 1010},
         {"quiet",     no_argument,       0, 'q'},
         {"verbose",   no_argument,       0, 'v'},
         {"help",      no_argument,       0, 'h'},
@@ -881,8 +881,8 @@ int main(int argc, char *argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "qvh", long_options, NULL)) != -1) {
         switch (opt) {
-            case 1000: printf("tsncap v%s\n", VERSION); return 0;
-            case 1010: g_config.tsn_only = 1; break;
+            case 1000: printf("rxcap v%s\n", VERSION); return 0;
+            case 1010: g_config.seq_only = 1; break;
             case 1001:
                 g_config.filter_vlan = 1;
                 g_config.vlan_id = atoi(optarg) & 0xfff;
