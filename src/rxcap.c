@@ -164,9 +164,9 @@ typedef struct {
     /* Sequence tracking (atomic for stats_thread safety) */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
-    atomic_uint_fast32_t first_seq;
-    atomic_uint_fast32_t last_seq;
-    atomic_int seq_started;
+    _Atomic(uint32_t) first_seq;
+    _Atomic(uint32_t) last_seq;
+    _Atomic(int) seq_started;
 
     /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
     atomic_uint_fast64_t latency_sum;
@@ -558,8 +558,10 @@ static void *rx_thread(void *arg) {
 
                     /* Sequence tracking (atomic for stats_thread safety) */
                     if (cfg->check_seq && pkt.has_seq) {
-                        if (!atomic_load(&g_stats.seq_started)) {
+                        if (atomic_load(&g_stats.seq_started) == 0) {
+                            /* First packet: set both first and last */
                             atomic_store(&g_stats.first_seq, pkt.seq_num);
+                            atomic_store(&g_stats.last_seq, pkt.seq_num);
                             atomic_store(&g_stats.seq_started, 1);
                         } else {
                             uint32_t last = atomic_load(&g_stats.last_seq);
@@ -568,8 +570,8 @@ static void *rx_thread(void *arg) {
                             } else if (pkt.seq_num != last + 1) {
                                 atomic_fetch_add(&g_stats.seq_errors, 1);
                             }
+                            atomic_store(&g_stats.last_seq, pkt.seq_num);
                         }
-                        atomic_store(&g_stats.last_seq, pkt.seq_num);
                     }
                 }
 
@@ -834,16 +836,19 @@ static void *stats_thread(void *arg) {
             uint64_t received = nonvlan_pkts - seq_dups;
 
             printf("\n  Sequence Analysis (non-VLAN):\n");
+            printf("    First seq:    %u\n", first);
+            printf("    Last seq:     %u\n", last);
             printf("    Out-of-order: %lu\n", seq_errors);
             printf("    Duplicates:   %lu\n", seq_dups);
 
-            /* Loss calculation only valid for single-worker (contiguous seq) */
-            if (seq_range > 0 && seq_range <= received * 2) {
+            /* Loss estimate: only meaningful for single-worker + contiguous seq
+             * Use seq_errors + kernel_drops for reliable loss indication */
+            if (seq_range > 0 && seq_range == received + seq_errors - seq_dups + 1) {
+                /* Perfect match - no loss detected */
+            } else if (seq_range > 0 && seq_range <= received * 2 && seq_range > received) {
                 int64_t lost = (int64_t)seq_range - (int64_t)received;
-                if (lost > 0) {
-                    double loss_pct = lost * 100.0 / seq_range;
-                    printf("    Lost:         %ld (%.2f%%)\n", lost, loss_pct);
-                }
+                double loss_pct = lost * 100.0 / seq_range;
+                printf("    Lost (est):   %ld (%.2f%%) - assumes contiguous seq\n", lost, loss_pct);
             }
         }
 
@@ -1048,10 +1053,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Initialize */
+    /* Initialize (g_stats is static, already zero-initialized) */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    memset(&g_stats, 0, sizeof(g_stats));
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
 
     /* Start RX thread */
