@@ -17,6 +17,23 @@
 | **txgen** | 패킷 생성 (TX) | sendmmsg 배치 전송, Multi-TC, VLAN PCP, pcap 재생 |
 | **rxcap** | 패킷 캡처 (RX) | recvmmsg 배치 수신, 지연/IAT 분석, pcap 저장 |
 
+## 테스트 결과
+
+USB Gigabit LAN 어댑터 2개 직결 환경에서 테스트 (2025-01-30):
+
+| 테스트 | 결과 | 비고 |
+|--------|:----:|------|
+| 100 Mbps | ✓ | packet loss 0% |
+| 500 Mbps | ✓ | packet loss 0% |
+| 1 Gbps | ✓ | 963 Mbps 달성, loss 0% |
+| VLAN Tagging | ✓ | PCP 0-7 정상 감지 |
+| Multi-TC | ✓ | PCP별 트래픽 분리 |
+| PCAP Capture | ✓ | Wireshark 호환 |
+| PCAP Replay | ✓ | 원본 속도 재생 |
+| CSV Output | ✓ | 전체 메트릭 출력 |
+| Sequence | ✓ | out-of-order 0, dup 0 |
+| Latency | ✓ | min 630us, avg 5-60ms |
+
 ## 요구사항
 
 - Linux (AF_PACKET, sendmmsg/recvmmsg 지원)
@@ -26,6 +43,8 @@
 ## 설치
 
 ```bash
+git clone https://github.com/hwkim3330/traffic-generator.git
+cd traffic-generator
 make
 sudo make install  # /usr/local/bin/
 ```
@@ -74,7 +93,7 @@ Layer 3:
 
 Layer 4:
   -t, --type TYPE            udp, tcp, icmp, raw (기본: udp)
-  -p, --port PORT|RANGE      목적지 포트 (기본: 9999)
+  -p, --port PORT|RANGE      목적지 포트 (기본: 5001)
   -P, --src-port PORT|RANGE  소스 포트
 
 Traffic Control:
@@ -88,7 +107,7 @@ Traffic Control:
 Payload:
   --seq                      시퀀스 번호 삽입 (4 bytes)
   --timestamp                타임스탬프 삽입 (8 bytes)
-  -s, --size SIZE            패킷 크기 (기본: 64)
+  -s, --size SIZE            패킷 크기 (기본: 1472)
 
 Multi-TC:
   --multi-tc TC_SPEC[:VLAN]  여러 TC 동시 전송 (예: 0-7:100)
@@ -202,7 +221,7 @@ sudo sysctl -w net.core.wmem_default=67108864
 sudo ./txgen eth0 ... --affinity
 sudo ./rxcap eth1 ... --affinity=2
 
-# 멀티 워커로 처리량 증가
+# 멀티 워커로 처리량 증가 (10Gbps+)
 sudo ./txgen eth0 ... -w 4 --affinity
 ```
 
@@ -211,12 +230,13 @@ sudo ./txgen eth0 ... -w 4 --affinity
 - PCAP 저장 시 5Gbps 이상에서 디스크 I/O 병목 가능
 - 높은 pps에서는 `--batch` 값 증가 고려
 - `kernel_drops`가 증가하면 수신 버퍼 증가 또는 CPU affinity 설정
+- 일부 NIC는 VLAN 태그를 하드웨어에서 strip (rxvlan offload)
 
 ## CSV 출력 스키마
 
 rxcap `--csv` 옵션 사용 시:
 
-```
+```csv
 time_s,total_pkts,total_pps,total_mbps,drops,
 pcp0_pkts,pcp1_pkts,...,pcp7_pkts,
 latency_min_ns,latency_avg_ns,latency_max_ns,
