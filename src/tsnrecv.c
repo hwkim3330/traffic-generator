@@ -83,7 +83,7 @@ static inline int tsn_is_new_format(const void *payload, size_t len) {
  * Constants
  *============================================================================*/
 
-#define VERSION "1.3.1"
+#define VERSION "1.3.2"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_BATCH_SIZE 256
@@ -114,6 +114,7 @@ typedef struct {
     uint16_t vlan_id;
     int filter_pcp;
     uint8_t pcp;
+    int tsn_only;   /* Only count packets with valid TSN header */
 
     /* Options */
     int duration;
@@ -143,10 +144,10 @@ typedef struct {
     /* Kernel/socket drops (from SO_RXQ_OVFL) */
     atomic_uint_fast64_t kernel_drops;
 
-    /* Global sequence tracking (for single-TC mode) */
+    /* Global sequence tracking (per flow_id for multi-worker) */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
-    uint32_t last_seq;
+    uint32_t last_seq[256];  /* Per flow_id */
 
     /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
     uint64_t latency_sum;
@@ -308,7 +309,7 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
                 }
 
                 if (TSN_HDR_HAS_TIMESTAMP(hdr)) {
-                    pkt->timestamp = hdr->timestamp;
+                    memcpy(&pkt->timestamp, &hdr->timestamp, sizeof(pkt->timestamp));
                     pkt->has_timestamp = 1;
                 }
             }
@@ -456,6 +457,9 @@ static void *rx_thread(void *arg) {
                 if (cfg->filter_pcp && (!pkt.has_vlan || pkt.pcp != cfg->pcp)) {
                     continue;
                 }
+                if (cfg->tsn_only && !pkt.new_format) {
+                    continue;  /* Skip non-TSN packets */
+                }
 
                 local_packets++;
                 local_bytes += len;
@@ -481,16 +485,17 @@ static void *rx_thread(void *arg) {
                 } else {
                     atomic_fetch_add(&g_stats.non_vlan_packets, 1);
 
-                    /* Global sequence tracking (for non-VLAN mode) */
+                    /* Per-flow sequence tracking (for multi-worker mode) */
                     if (cfg->check_seq && pkt.has_seq) {
-                        if (g_stats.last_seq != 0) {
-                            if (pkt.seq_num == g_stats.last_seq) {
+                        uint32_t *last = &g_stats.last_seq[pkt.flow_id];
+                        if (*last != 0) {
+                            if (pkt.seq_num == *last) {
                                 atomic_fetch_add(&g_stats.seq_duplicates, 1);
-                            } else if (pkt.seq_num != g_stats.last_seq + 1) {
+                            } else if (pkt.seq_num != *last + 1) {
                                 atomic_fetch_add(&g_stats.seq_errors, 1);
                             }
                         }
-                        g_stats.last_seq = pkt.seq_num;
+                        *last = pkt.seq_num;
                     }
                 }
 
@@ -769,7 +774,8 @@ static void print_usage(const char *prog) {
     printf("  --batch NUM              Batch size (default: 256)\n");
     printf("\n");
     printf("Analysis:\n");
-    printf("  --seq                    Track sequence numbers (per-PCP for VLAN traffic)\n");
+    printf("  --seq                    Track sequence numbers (per-flow_id)\n");
+    printf("  --tsn-only               Only count packets with TSN header (filter noise)\n");
     printf("  --latency                Measure latency (requires tsngen --timestamp)\n");
     printf("  --pcp-stats              Show per-PCP statistics\n");
     printf("\n");
@@ -831,6 +837,7 @@ int main(int argc, char *argv[]) {
         {"pcp-stats", no_argument,       0, 1007},
         {"csv",       required_argument, 0, 1008},
         {"affinity",  optional_argument, 0, 1009},
+        {"tsn-only", no_argument,       0, 1010},
         {"quiet",     no_argument,       0, 'q'},
         {"verbose",   no_argument,       0, 'v'},
         {"help",      no_argument,       0, 'h'},
@@ -842,6 +849,7 @@ int main(int argc, char *argv[]) {
     while ((opt = getopt_long(argc, argv, "qvh", long_options, NULL)) != -1) {
         switch (opt) {
             case 1000: printf("tsnrecv v%s\n", VERSION); return 0;
+            case 1010: g_config.tsn_only = 1; break;
             case 1001:
                 g_config.filter_vlan = 1;
                 g_config.vlan_id = atoi(optarg) & 0xfff;

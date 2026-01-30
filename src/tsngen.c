@@ -683,10 +683,11 @@ static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq, uin
             }
 
             if (cfg->add_timestamp) {
-                hdr->timestamp = get_time_ns();
+                uint64_t ts = get_time_ns();
+                memcpy(&hdr->timestamp, &ts, sizeof(ts));
                 hdr->flags |= TSN_FLAG_TIMESTAMP;
             } else {
-                hdr->timestamp = 0;
+                memset(&hdr->timestamp, 0, sizeof(hdr->timestamp));
             }
 
             hdr->payload_len = htonl(len - TSN_PAYLOAD_HDR_SIZE);
