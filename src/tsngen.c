@@ -50,6 +50,8 @@
 #include <linux/if_ether.h>
 #include <sched.h>
 
+#include "tsn_payload.h"
+
 /* PACKET_FANOUT definitions (if not provided by system headers) */
 #ifndef PACKET_FANOUT
 #define PACKET_FANOUT 18
@@ -71,7 +73,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.6.0"
+#define VERSION "1.7.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
@@ -204,6 +206,8 @@ typedef struct {
     /* Sequence & Timestamp */
     int add_seq_num;
     int add_timestamp;
+    int legacy_payload;     /* Use legacy 12-byte header instead of new 24-byte */
+    uint8_t current_tc;     /* Current TC index (set by fork in multi-TC mode) */
 
     /* Statistics */
     char stats_file[256];
@@ -613,52 +617,97 @@ static int build_tcp_packet(uint8_t *buf, config_t *cfg,
     return sizeof(struct tcphdr);
 }
 
-static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq) {
-    switch (cfg->payload_type) {
-        case PAYLOAD_ZERO:
-            memset(buf, 0, len);
-            break;
-        case PAYLOAD_RANDOM:
-            for (int i = 0; i < len; i++) {
-                buf[i] = rand() & 0xff;
+static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq, uint8_t worker_id) {
+    int hdr_size = 0;
+    uint8_t *data_start = buf;
+
+    /*
+     * TSN Payload Header (new format or legacy)
+     */
+    if ((cfg->add_seq_num || cfg->add_timestamp) && !cfg->legacy_payload) {
+        /* New format: 24-byte structured header */
+        if (len >= TSN_PAYLOAD_HDR_SIZE) {
+            tsn_payload_hdr_t *hdr = (tsn_payload_hdr_t *)buf;
+
+            hdr->magic = htonl(TSN_PAYLOAD_MAGIC);
+            hdr->version = TSN_PAYLOAD_VERSION;
+            hdr->flags = 0;
+            hdr->reserved = 0;
+
+            /* Flow ID: encode TC and worker for per-flow tracking */
+            hdr->flow_id = tsn_encode_flow_id(cfg->current_tc, worker_id);
+            hdr->flags |= TSN_FLAG_FLOW_ID;
+
+            if (cfg->add_seq_num) {
+                hdr->seq_num = htonl(seq);
+                hdr->flags |= TSN_FLAG_SEQ;
+            } else {
+                hdr->seq_num = 0;
             }
-            break;
-        case PAYLOAD_INCREMENT:
-            for (int i = 0; i < len; i++) {
-                buf[i] = (uint8_t)(i & 0xff);
+
+            if (cfg->add_timestamp) {
+                hdr->timestamp = get_time_ns();
+                hdr->flags |= TSN_FLAG_TIMESTAMP;
+            } else {
+                hdr->timestamp = 0;
             }
-            break;
-        case PAYLOAD_PATTERN:
-            {
-                int plen = strlen(cfg->payload_pattern);
-                if (plen > 0) {
-                    for (int i = 0; i < len; i++) {
-                        buf[i] = cfg->payload_pattern[i % plen];
+
+            hdr->payload_len = htonl(len - TSN_PAYLOAD_HDR_SIZE);
+            hdr_size = TSN_PAYLOAD_HDR_SIZE;
+            data_start = buf + hdr_size;
+        }
+    } else if ((cfg->add_seq_num || cfg->add_timestamp) && cfg->legacy_payload) {
+        /* Legacy format: 12-byte simple header (backward compatible) */
+        if (cfg->add_seq_num && len >= 4) {
+            uint32_t net_seq = htonl(seq);
+            memcpy(buf, &net_seq, 4);
+            hdr_size = 4;
+        }
+        if (cfg->add_timestamp && len >= 12) {
+            uint64_t ts = get_time_ns();
+            memcpy(buf + 4, &ts, 8);
+            hdr_size = 12;
+        }
+        data_start = buf + hdr_size;
+    }
+
+    /* Fill remaining payload with pattern */
+    int data_len = len - hdr_size;
+    if (data_len > 0) {
+        switch (cfg->payload_type) {
+            case PAYLOAD_ZERO:
+                memset(data_start, 0, data_len);
+                break;
+            case PAYLOAD_RANDOM:
+                for (int i = 0; i < data_len; i++) {
+                    data_start[i] = rand() & 0xff;
+                }
+                break;
+            case PAYLOAD_INCREMENT:
+                for (int i = 0; i < data_len; i++) {
+                    data_start[i] = (uint8_t)(i & 0xff);
+                }
+                break;
+            case PAYLOAD_PATTERN:
+                {
+                    int plen = strlen(cfg->payload_pattern);
+                    if (plen > 0) {
+                        for (int i = 0; i < data_len; i++) {
+                            data_start[i] = cfg->payload_pattern[i % plen];
+                        }
                     }
                 }
-            }
-            break;
-        case PAYLOAD_ASCII:
-            if (cfg->payload_size > 0) {
-                int copy_len = (len < cfg->payload_size) ? len : cfg->payload_size;
-                memcpy(buf, cfg->payload, copy_len);
-                if (len > copy_len) {
-                    memset(buf + copy_len, 0, len - copy_len);
+                break;
+            case PAYLOAD_ASCII:
+                if (cfg->payload_size > 0) {
+                    int copy_len = (data_len < cfg->payload_size) ? data_len : cfg->payload_size;
+                    memcpy(data_start, cfg->payload, copy_len);
+                    if (data_len > copy_len) {
+                        memset(data_start + copy_len, 0, data_len - copy_len);
+                    }
                 }
-            }
-            break;
-    }
-
-    /* Add sequence number at start if requested */
-    if (cfg->add_seq_num && len >= 4) {
-        uint32_t net_seq = htonl(seq);
-        memcpy(buf, &net_seq, 4);
-    }
-
-    /* Add timestamp if requested */
-    if (cfg->add_timestamp && len >= 12) {
-        uint64_t ts = get_time_ns();
-        memcpy(buf + 4, &ts, 8);
+                break;
+        }
     }
 }
 
@@ -682,7 +731,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
     if (cfg->pkt_type == PKT_ETH_RAW) {
         int payload_len = pkt_size - offset;
         if (payload_len > 0) {
-            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num++);
+            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num++, ctx->id);
             offset += payload_len;
         }
     } else {
@@ -739,7 +788,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
 
         /* Payload */
         if (payload_len > 0) {
-            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num);
+            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num++, ctx->id);
             offset += payload_len;
         }
     }
@@ -1256,6 +1305,7 @@ static void print_usage(const char *prog) {
     printf("  --payload-ascii TEXT     ASCII payload\n");
     printf("  --seq                    Add sequence number to payload\n");
     printf("  --timestamp              Add timestamp to payload\n");
+    printf("  --legacy-payload         Use legacy 12-byte header (default: new 24-byte)\n");
     printf("\n");
     printf("Checksum:\n");
     printf("  --ip-csum                Calculate IP checksum\n");
@@ -1460,6 +1510,7 @@ int main(int argc, char *argv[]) {
         {"df",            no_argument,       0, 1020},
         {"seq",           no_argument,       0, 1021},
         {"timestamp",     no_argument,       0, 1022},
+        {"legacy-payload", no_argument,     0, 1026},
         {"ip-csum",       no_argument,       0, 1023},
         {"l4-csum",       no_argument,       0, 1024},
         {"quiet",         no_argument,       0, 'q'},
@@ -1658,6 +1709,7 @@ int main(int argc, char *argv[]) {
             case 1023: g_config.calc_ip_csum = 1; break;
             case 1024: g_config.calc_l4_csum = 1; break;
             case 1025: g_config.rate_per_tc = 1; break;
+            case 1026: g_config.legacy_payload = 1; break;
             case 'q': g_config.quiet = 1; break;
             case 'v': g_config.verbose = 1; break;
             case 'S': g_config.simulation = 1; break;
@@ -1818,11 +1870,11 @@ int main(int argc, char *argv[]) {
 
                 /*
                  * Sequence offset per TC:
-                 * Each TC gets a unique base offset to avoid sequence collision.
-                 * TC0: 0-99M, TC1: 100M-199M, TC2: 200M-299M, etc.
-                 * Within each TC, workers get their own sub-offset.
+                 * Using new tsn_seq_start() for proper TC/worker encoding.
+                 * TC is encoded in upper bits of sequence number.
                  */
-                g_config.tc_seq_offset = (uint64_t)i * 100000000ULL;
+                g_config.current_tc = tc;
+                g_config.tc_seq_offset = 0;  /* Will use tsn_seq_start() instead */
 
                 /* Quiet mode for children */
                 g_config.quiet = 1;
@@ -1857,8 +1909,13 @@ int main(int argc, char *argv[]) {
         contexts[i].cfg = &g_config;
         contexts[i].stats = &g_stats[i];
         contexts[i].bucket = &g_bucket;
-        /* Sequence: tc_seq_offset + (worker_id * 1M) to avoid collision */
-        contexts[i].seq_num = g_config.tc_seq_offset + (uint32_t)(i * 1000000);
+        /*
+         * Sequence number encoding (from tsn_payload.h):
+         * Upper 3 bits: TC (0-7)
+         * Next 4 bits: Worker ID (0-15)
+         * Lower 24 bits: Counter (~16M per worker)
+         */
+        contexts[i].seq_num = tsn_seq_start(g_config.current_tc, i);
 
         if (pthread_create(&g_workers[i], NULL, worker_thread, &contexts[i]) != 0) {
             fprintf(stderr, "Failed to create worker %d\n", i);

@@ -1,5 +1,5 @@
 /*
- * tsnrecv - High-Performance TSN Traffic Receiver v1.2.0
+ * tsnrecv - High-Performance TSN Traffic Receiver v1.3.0
  * Companion tool for tsngen - measures TSN traffic characteristics
  *
  * Copyright (C) 2025
@@ -39,6 +39,8 @@
 #include <linux/if_ether.h>
 #include <sched.h>
 
+#include "tsn_payload.h"
+
 /* SO_RXQ_OVFL for drop detection (if not defined) */
 #ifndef SO_RXQ_OVFL
 #define SO_RXQ_OVFL 40
@@ -48,7 +50,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.2.0"
+#define VERSION "1.3.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_BATCH_SIZE 256
 #define STATS_INTERVAL_US 1000000
@@ -186,21 +188,26 @@ static int get_if_index(const char *ifname) {
  *============================================================================*/
 
 /*
- * TSN Payload Header (12 bytes):
- * - Bytes 0-3:  Sequence number (network order)
- * - Bytes 4-11: Timestamp (CLOCK_MONOTONIC_RAW ns, host order)
+ * TSN Payload Header formats:
  *
- * For Multi-TC mode, PCP is used as flow_id for per-PCP sequence tracking.
+ * New format (v1, 24 bytes): Magic + version + flags + flow_id + seq + timestamp + len
+ * Legacy format (12 bytes): seq (4) + timestamp (8)
+ *
+ * Use tsn_payload.h for header definitions.
  */
 typedef struct {
     uint8_t src_mac[6];
     uint8_t dst_mac[6];
     int has_vlan;
     uint16_t vlan_id;
-    uint8_t pcp;        /* Also used as flow_id for per-PCP seq tracking */
+    uint8_t pcp;
     uint8_t dei;
     uint16_t ethertype;
     int payload_offset;
+
+    /* TSN header fields */
+    int new_format;         /* 1 = new 24-byte format, 0 = legacy */
+    uint8_t flow_id;        /* Flow ID from new header (or derived from PCP) */
     uint32_t seq_num;
     uint64_t timestamp;
     int has_seq;
@@ -238,8 +245,8 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     pkt->ethertype = ethertype;
     pkt->payload_offset = offset;
 
-    /* Try to extract sequence number and timestamp from UDP payload */
-    if (ethertype == 0x0800 && len >= offset + 20 + 8 + 12) {
+    /* Try to extract TSN header from UDP payload */
+    if (ethertype == 0x0800 && len >= offset + 20 + 8) {
         /* IP header (assuming no options) */
         int ip_offset = offset;
         uint8_t ip_proto = buf[ip_offset + 9];
@@ -247,15 +254,42 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
         if (ip_proto == 17) {  /* UDP */
             int udp_offset = ip_offset + 20;
             int payload_start = udp_offset + 8;
+            int payload_len = len - payload_start;
 
-            if (len >= payload_start + 4) {
+            /* Check for new TSN header format (24 bytes, magic = "TSN1") */
+            if (payload_len >= TSN_PAYLOAD_HDR_SIZE &&
+                tsn_is_new_format(buf + payload_start, payload_len)) {
+
+                const tsn_payload_hdr_t *hdr = (const tsn_payload_hdr_t *)(buf + payload_start);
+                pkt->new_format = 1;
+
+                if (TSN_HDR_HAS_FLOW_ID(hdr)) {
+                    pkt->flow_id = hdr->flow_id;
+                } else {
+                    /* Default: use PCP as flow_id */
+                    pkt->flow_id = pkt->has_vlan ? pkt->pcp : 0;
+                }
+
+                if (TSN_HDR_HAS_SEQ(hdr)) {
+                    pkt->seq_num = ntohl(hdr->seq_num);
+                    pkt->has_seq = 1;
+                }
+
+                if (TSN_HDR_HAS_TIMESTAMP(hdr)) {
+                    pkt->timestamp = hdr->timestamp;
+                    pkt->has_timestamp = 1;
+                }
+            }
+            /* Legacy format (12 bytes): seq(4) + timestamp(8) */
+            else if (payload_len >= TSN_LEGACY_HDR_SIZE) {
+                pkt->new_format = 0;
+                pkt->flow_id = pkt->has_vlan ? pkt->pcp : 0;
+
                 /* First 4 bytes: sequence number (network order) */
                 memcpy(&pkt->seq_num, buf + payload_start, 4);
                 pkt->seq_num = ntohl(pkt->seq_num);
                 pkt->has_seq = 1;
-            }
 
-            if (len >= payload_start + 12) {
                 /* Next 8 bytes: timestamp */
                 memcpy(&pkt->timestamp, buf + payload_start + 4, 8);
                 pkt->has_timestamp = 1;

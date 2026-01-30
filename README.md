@@ -11,7 +11,7 @@
 
 ## 주요 기능
 
-### tsngen (TX) v1.6.0
+### tsngen (TX) v1.7.0
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
 - **Multi-TC 모드** - 8개 TC 동시 전송
 - **VLAN PCP/DEI** 지원
@@ -21,7 +21,7 @@
 - **패킷간 딜레이** (ns/us/ms 정밀도)
 - **CLOCK_MONOTONIC_RAW** 타임스탬프
 
-### tsnrecv (RX) v1.2.0
+### tsnrecv (RX) v1.3.0
 - **recvmmsg** 고속 배치 수신
 - **SO_RXQ_OVFL** - 커널 드롭 감지
 - **PCP별 실시간 통계** - CBS/TAS 검증
@@ -123,6 +123,53 @@ Output:
 - **RX**: tsnrecv `--latency`로 수신 시각과 비교
 - **제한**: TX/RX가 같은 머신에서 동작해야 정확한 지연 측정
 - **Cross-machine**: PTP 동기화된 HW 타임스탬프 사용 필요
+
+## TSN Payload 헤더 (v1.7.0+)
+
+`--seq` 또는 `--timestamp` 사용 시 UDP payload에 구조화된 헤더 삽입:
+
+### 새 포맷 (24 bytes, 기본)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Magic (0x54534E31 "TSN1")              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|    Version    |    Flags      |   Flow ID     |   Reserved   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Sequence Number                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                    Timestamp (ns, host order)                +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Payload Length                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Magic**: `0x54534E31` ("TSN1") - 포맷 식별
+- **Flow ID**: `(TC << 4) | Worker` - per-flow 시퀀스 추적용
+- **Flags**: SEQ(0x01), TIMESTAMP(0x02), FLOW_ID(0x04)
+
+### 레거시 포맷 (12 bytes, `--legacy-payload`)
+
+```
+Bytes 0-3:  Sequence (network order)
+Bytes 4-11: Timestamp (host order)
+```
+
+이전 버전 호환용.
+
+### 시퀀스 번호 인코딩
+
+```
+Bits 31-29: TC (0-7)
+Bits 28-24: Worker ID (0-15)
+Bits 23-0:  Counter (~16M per worker)
+```
+
+예: TC2 Worker3 → 시퀀스 시작 = `0x23000000`
 
 ## 드롭 감지
 
@@ -301,7 +348,8 @@ sudo ./tsnrecv eth0 --batch 512 ...
 ## 버전 히스토리
 
 ### tsngen
-- v1.6.0: Multi-TC 시퀀스 충돌 수정 (TC별 100M offset)
+- v1.7.0: 표준 TSN payload 헤더 (24B), flow_id, --legacy-payload
+- v1.6.0: Multi-TC 시퀀스 충돌 수정 (TC별 offset)
 - v1.5.0: CLOCK_MONOTONIC_RAW, --rate-per-tc 옵션
 - v1.4.0: PACKET_FANOUT, CPU Affinity, RX 통계
 - v1.3.0: Multi-TC 모드
@@ -309,6 +357,7 @@ sudo ./tsnrecv eth0 --batch 512 ...
 - v1.0.0: 초기 버전
 
 ### tsnrecv
+- v1.3.0: TSN payload 헤더 v1 파싱, flow_id 지원, 레거시 호환
 - v1.2.0: Latency 경고 (drops>0), CSV -1 처리, 버그 수정
 - v1.1.0: SO_RXQ_OVFL 드롭 감지, CLOCK_MONOTONIC_RAW, per-PCP 시퀀스, CPU affinity, CSV 스키마 표준화
 - v1.0.0: 초기 버전 (recvmmsg, PCP 통계, 지연 분석)
