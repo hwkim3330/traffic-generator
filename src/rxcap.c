@@ -117,7 +117,8 @@ typedef struct {
 typedef struct {
     atomic_uint_fast64_t packets;
     atomic_uint_fast64_t bytes;
-    /* Per-PCP sequence tracking */
+    /* Per-PCP sequence tracking
+     * last_seq: RX-thread only (not atomic by design - single writer) */
     uint32_t last_seq;
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
@@ -223,7 +224,8 @@ typedef struct {
     uint64_t ts_ns;
 } pcap_entry_t;
 
-/* Batch write multiple packets to pcap (single lock acquisition) */
+/* Batch write multiple packets to pcap (single lock acquisition)
+ * On write error: close file to avoid infinite stall, RX continues without pcap */
 static void pcap_write_batch(pcap_entry_t *entries, int count) {
     if (!g_pcap_fp || count == 0) return;
 
@@ -235,8 +237,14 @@ static void pcap_write_batch(pcap_entry_t *entries, int count) {
             .incl_len = entries[i].len,
             .orig_len = entries[i].len
         };
-        fwrite(&pkthdr, sizeof(pkthdr), 1, g_pcap_fp);
-        fwrite(entries[i].data, entries[i].len, 1, g_pcap_fp);
+        if (fwrite(&pkthdr, sizeof(pkthdr), 1, g_pcap_fp) != 1 ||
+            fwrite(entries[i].data, entries[i].len, 1, g_pcap_fp) != 1) {
+            /* Disk full or I/O error - disable pcap to prevent stall */
+            fprintf(stderr, "Warning: PCAP write failed, disabling capture\n");
+            fclose(g_pcap_fp);
+            g_pcap_fp = NULL;
+            break;
+        }
     }
     pthread_mutex_unlock(&g_pcap_lock);
 }
@@ -587,13 +595,14 @@ static void *rx_thread(void *arg) {
                 }
 
                 /* Latency */
+                /* Latency (init: UINT64_MAX, so simple < comparison works) */
                 if (cfg->measure_latency && pkt.has_timestamp) {
                     uint64_t latency = now_ns - pkt.timestamp;
                     atomic_fetch_add(&g_stats.latency_sum, latency);
                     atomic_fetch_add(&g_stats.latency_count, 1);
 
                     uint64_t cur = atomic_load(&g_stats.latency_min);
-                    while (cur == 0 || latency < cur) {
+                    while (latency < cur) {
                         if (atomic_compare_exchange_weak(&g_stats.latency_min, &cur, latency)) break;
                     }
                     cur = atomic_load(&g_stats.latency_max);
@@ -602,14 +611,14 @@ static void *rx_thread(void *arg) {
                     }
                 }
 
-                /* IAT */
+                /* IAT (init: UINT64_MAX, so simple < comparison works) */
                 if (g_stats.last_arrival_ns > 0) {
                     uint64_t iat = now_ns - g_stats.last_arrival_ns;
                     atomic_fetch_add(&g_stats.iat_sum, iat);
                     atomic_fetch_add(&g_stats.iat_count, 1);
 
                     uint64_t cur = atomic_load(&g_stats.iat_min);
-                    while (cur == 0 || iat < cur) {
+                    while (iat < cur) {
                         if (atomic_compare_exchange_weak(&g_stats.iat_min, &cur, iat)) break;
                     }
                     cur = atomic_load(&g_stats.iat_max);
@@ -1070,11 +1079,11 @@ int main(int argc, char *argv[]) {
     atomic_store(&g_stats.last_seq, 0);
     atomic_store(&g_stats.latency_sum, 0);
     atomic_store(&g_stats.latency_count, 0);
-    atomic_store(&g_stats.latency_min, 0);
+    atomic_store(&g_stats.latency_min, UINT64_MAX);  /* Use MAX for proper min tracking */
     atomic_store(&g_stats.latency_max, 0);
     atomic_store(&g_stats.iat_sum, 0);
     atomic_store(&g_stats.iat_count, 0);
-    atomic_store(&g_stats.iat_min, 0);
+    atomic_store(&g_stats.iat_min, UINT64_MAX);  /* Use MAX for proper min tracking */
     atomic_store(&g_stats.iat_max, 0);
     g_stats.last_arrival_ns = 0;
     for (int p = 0; p < MAX_PCP; p++) {

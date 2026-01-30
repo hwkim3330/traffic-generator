@@ -528,15 +528,13 @@ static int token_bucket_consume(token_bucket_t *tb, size_t bytes) {
         double needed = (double)bytes - tb->tokens;
         double sleep_ns = needed / tb->tokens_per_ns;
 
-        if (sleep_ns < 1000) {
-            sched_yield();
-        } else {
-            struct timespec ts = {
-                .tv_sec  = (time_t)(sleep_ns / 1e9),
-                .tv_nsec = (long)((uint64_t)sleep_ns % (uint64_t)1e9)
-            };
-            nanosleep(&ts, NULL);
-        }
+        /* Always use nanosleep for backoff (sched_yield is no-op on CFS) */
+        struct timespec ts = {
+            .tv_sec  = 0,
+            .tv_nsec = sleep_ns < 1000 ? 1000 : (long)((uint64_t)sleep_ns % (uint64_t)1e9)
+        };
+        if (sleep_ns >= 1e9) ts.tv_sec = (time_t)(sleep_ns / 1e9);
+        nanosleep(&ts, NULL);
     }
     return 0;
 }
@@ -942,6 +940,8 @@ static void *worker_thread(void *arg) {
                     local_packets++;
                     local_bytes += pkt_sizes[i];
                 }
+                /* Partial send counted as TX error (kernel queue/resource limit)
+                 * Intent: treat all unsent packets as experiment loss */
                 if (sent < batch) {
                     local_errors += (batch - sent);
                 }
@@ -1561,7 +1561,7 @@ int main(int argc, char *argv[]) {
     g_config.pkt_type = PKT_UDP;
     g_config.packet_size = DEFAULT_PACKET_SIZE;
     g_config.batch_size = DEFAULT_BATCH_SIZE;
-    g_config.num_workers = sysconf(_SC_NPROCESSORS_ONLN);
+    g_config.num_workers = 1;  /* Default 1 for accurate seq/latency; use -w for throughput */
     g_config.payload_type = PAYLOAD_INCREMENT;
     g_config.calc_ip_csum = 1;
 
