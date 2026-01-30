@@ -1,5 +1,5 @@
 /*
- * trafgen - High-Performance Traffic Generator v1.4.0
+ * tsngen - High-Performance Traffic Generator v1.4.0
  * Based on Mausezahn concepts, enhanced with modern Linux networking features
  *
  * Copyright (C) 2025
@@ -1027,7 +1027,7 @@ static void *stats_thread(void *arg) {
     if (!cfg->quiet) {
         printf("\n");
         printf("════════════════════════════════════════════════════════════════════════════════════════════\n");
-        printf(" trafgen v%s - High-Performance Traffic Generator\n", VERSION);
+        printf(" tsngen v%s - High-Performance Traffic Generator\n", VERSION);
         printf(" %d workers, %d byte packets, batch %d, rate: %s",
                cfg->num_workers, cfg->packet_size, cfg->batch_size,
                cfg->rate_mbps > 0 ? "" : "unlimited");
@@ -1185,7 +1185,7 @@ static void *stats_thread(void *arg) {
 
 static void print_usage(const char *prog) {
     printf("\n");
-    printf("trafgen v%s - High-Performance Traffic Generator\n", VERSION);
+    printf("tsngen v%s - High-Performance Traffic Generator\n", VERSION);
     printf("\n");
     printf("Usage: %s [options] <interface>\n", prog);
     printf("\n");
@@ -1650,7 +1650,7 @@ int main(int argc, char *argv[]) {
             case 'v': g_config.verbose = 1; break;
             case 'S': g_config.simulation = 1; break;
             case 'h': print_usage(argv[0]); return 0;
-            case 1000: printf("trafgen v%s\n", VERSION); return 0;
+            case 1000: printf("tsngen v%s\n", VERSION); return 0;
             default: print_usage(argv[0]); return 1;
         }
     }

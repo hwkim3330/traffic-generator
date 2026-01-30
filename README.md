@@ -1,265 +1,159 @@
-# trafgen - High-Performance Traffic Generator v1.4.0
+# TSN Traffic Tools - tsngen & tsnrecv
 
-Mausezahn(mz) 소스코드를 기반으로 개선한 고성능 트래픽 생성기.
-TSN (Time-Sensitive Networking) 테스트에 최적화.
+고성능 TSN (Time-Sensitive Networking) 트래픽 생성 및 분석 도구.
+
+## 도구 구성
+
+| 도구 | 용도 | 핵심 기능 |
+|------|------|----------|
+| **tsngen** | 트래픽 생성 (TX) | sendmmsg 배치 전송, Multi-TC, VLAN PCP |
+| **tsnrecv** | 트래픽 수신 (RX) | recvmmsg 배치 수신, PCP별 통계, 지연 분석 |
 
 ## 주요 기능
 
+### tsngen (TX)
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
-- **VLAN PCP/DEI** 지원 (802.1p 우선순위)
 - **Multi-TC 모드** - 8개 TC 동시 전송
-- **RX 통계** - 손실률 실시간 측정
+- **VLAN PCP/DEI** 지원
 - **tc/qdisc 연동** (SO_PRIORITY, PACKET_FANOUT)
-- **CPU Affinity** - 코어 고정
-- **DSCP/QoS** 마킹
 - **토큰 버킷** 정밀 레이트 제한
 - **패킷간 딜레이** (ns/us/ms 정밀도)
 
-## 개선사항 (vs mz)
-
-| 기능 | mz | trafgen |
-|------|-----|---------|
-| 패킷 전송 | libnet_write() 단일 전송 | **sendmmsg() 배치 전송** |
-| 멀티스레딩 | 제한적 | **완전한 멀티스레드** |
-| 실시간 통계 | 종료 시 출력 | **1초 간격 실시간 출력** |
-| Rate limiting | usleep 기반 | **토큰 버킷** |
-| VLAN 우선순위 | PCP만 | **PCP + DEI** |
-| tc 연동 | 없음 | **SO_PRIORITY + FANOUT** |
-| Multi-TC | 없음 | **8개 TC 동시 전송** |
-| RX 통계 | 없음 | **손실률 측정** |
-| CPU 최적화 | 없음 | **Affinity 지원** |
-| 최대 처리량 | ~1 Gbps | **10+ Gbps** |
+### tsnrecv (RX)
+- **recvmmsg** 고속 배치 수신
+- **PCP별 실시간 통계** - CBS/TAS 검증
+- **VLAN 필터링** - 특정 VLAN/PCP만 캡처
+- **시퀀스 추적** - 패킷 손실/순서 오류 감지
+- **지연 측정** - tsngen 타임스탬프 기반
+- **Inter-arrival time** - 패킷 간격 분석
+- **CSV 출력** - 후처리 분석용
 
 ## 설치
 
 ```bash
-# 빌드
 make
-
-# 시스템 설치 (선택)
-sudo make install
+sudo make install  # 선택
 ```
 
 ## 빠른 시작
 
 ```bash
-# 기본 UDP 트래픽 (최대 속도)
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55
+# TX: 8개 TC 동시 전송
+sudo ./tsngen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 --multi-tc 0-7:100 -r 100
 
-# 1 Gbps, 10초
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -r 1000 --duration 10
+# RX: PCP별 통계 수집
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --duration 60
 
-# 8개 TC 동시 전송 (TSN 테스트)
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 --multi-tc 0-7:100
-
-# TX/RX 손실률 측정
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -R
+# 손실률/지연 측정
+sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 --seq --timestamp &
+sudo ./tsnrecv eth1 --vlan 100 --seq --latency
 ```
 
-## 전체 옵션
+## tsngen 옵션
 
 ```
-Usage: trafgen [options] <interface>
+Usage: tsngen [options] <interface>
 
 Required:
-  <interface>              네트워크 인터페이스
-  -B, --dst-ip IP          목적지 IP 주소
-  -b, --dst-mac MAC        목적지 MAC 주소
+  -B, --dst-ip IP          목적지 IP
+  -b, --dst-mac MAC        목적지 MAC
 
-Layer 2:
-  -a, --src-mac MAC|rand   출발지 MAC
-  -Q, --vlan [PCP[.DEI]:]VLAN  VLAN 태그 (다중 지정 가능)
-                           예: 100, 5:100, 5.1:100
-
-Layer 3:
-  -A, --src-ip IP|rand|IP-IP  출발지 IP (단일/랜덤/범위)
+Layer 2/3/4:
+  -Q, --vlan [PCP[.DEI]:]VLAN  VLAN 태그 (예: 6:100, 6.1:100)
+  -A, --src-ip IP|rand|IP-IP   소스 IP (범위 지원)
   -D, --dscp VALUE         DSCP 0-63
-  -T, --ttl VALUE          TTL (기본: 64)
-  --df                     Don't Fragment 플래그
-
-Layer 4:
-  -t, --type TYPE          udp, tcp, icmp, raw (기본: udp)
-  -p, --port PORT|PORT-PORT  목적지 포트 (단일/범위)
-  -P, --src-port PORT      출발지 포트
-  --tcp-flags FLAGS        TCP 플래그: S=SYN,A=ACK,F=FIN,R=RST,P=PSH,U=URG
+  -t, --type TYPE          udp, tcp, icmp, raw
+  -p, --port PORT|PORT-PORT    포트 (범위 지원)
 
 Traffic Control:
-  -c, --count NUM          패킷 수 (0=무한)
-  -r, --rate MBPS          속도 제한 (Mbps)
-  --pps NUM                속도 제한 (pps)
-  --duration SEC           지속 시간 (초)
-  -w, --workers NUM        워커 스레드 수 (기본: CPU 수)
-  --batch NUM              배치 크기 (기본: 512)
-  -d, --delay DELAY        패킷간 딜레이 (100ns, 10us, 1ms)
-  --delay-per-pkt          패킷당 딜레이 적용 (기본: 배치당)
-  --skb-priority NUM       소켓 우선순위 (tc/qdisc 연동)
+  -r, --rate MBPS          속도 제한
+  --duration SEC           지속 시간
   --multi-tc TC[:VLAN]     멀티 TC 모드 (예: 0-7:100)
+  -d, --delay DELAY        패킷간 딜레이 (100ns, 10us, 1ms)
+  --skb-priority NUM       SO_PRIORITY (tc 연동)
 
 Performance:
-  --fanout[=MODE]          PACKET_FANOUT (hash,lb,cpu,rnd)
-  --affinity               워커 스레드 CPU 코어 고정
-
-RX Statistics:
-  -R, --rx[=IFACE]         RX 통계 활성화 (손실률 측정)
+  --affinity               CPU 코어 고정
+  --fanout[=MODE]          PACKET_FANOUT
 
 Packet:
-  -l, --length SIZE|MIN-MAX  패킷 크기 (고정/랜덤 범위)
-  --payload-type TYPE      zero, random, increment, pattern, ascii
   --seq                    시퀀스 번호 삽입
   --timestamp              타임스탬프 삽입
-
-Checksum:
-  --ip-csum                IP 체크섬 계산
-  --l4-csum                TCP/UDP 체크섬 계산
+  -l, --length SIZE|MIN-MAX    패킷 크기
 
 Output:
-  --stats-file FILE        통계 CSV 파일 출력
+  --stats-file FILE        CSV 통계 출력
+  -R, --rx[=IFACE]         RX 통계 (손실률)
+```
+
+## tsnrecv 옵션
+
+```
+Usage: tsnrecv [options] <interface>
+
+Filter:
+  --vlan VID               VLAN ID 필터
+  --pcp NUM                PCP 필터 (0-7)
+
+Capture:
+  --duration SEC           캡처 시간 (0=무한)
+  --batch NUM              배치 크기 (기본: 256)
+
+Analysis:
+  --seq                    시퀀스 추적 (손실/순서 오류)
+  --latency                지연 측정 (tsngen --timestamp 필요)
+  --pcp-stats              PCP별 통계 표시
+
+Output:
+  --csv FILE               CSV 파일 출력
   -q, --quiet              조용히 실행
-  -v, --verbose            상세 출력
 ```
 
-## 예제
+## 사용 예제
 
-### 기본 트래픽
+### 기본 트래픽 생성/수신
 
 ```bash
-# 최대 속도
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55
+# TX: 1 Gbps UDP
+sudo ./tsngen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -r 1000
 
-# 속도 제한
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -r 1000 --duration 60
-
-# 작은 패킷 (높은 PPS)
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -l 64
+# RX: 모든 트래픽 캡처
+sudo ./tsnrecv eth1 --duration 60
 ```
 
-### VLAN 태깅
+### Multi-TC TSN 테스트
 
 ```bash
-# VLAN 100
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 100
+# TX: 8개 TC 동시 전송
+sudo ./tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 -r 100 --duration 60
 
-# PCP 6, VLAN 100
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 6:100
-
-# PCP 6, DEI 1, VLAN 100
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 6.1:100
-
-# QinQ (이중 VLAN)
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 100 -Q 200
+# RX: PCP별 통계
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --duration 60
 ```
 
-### Multi-TC 모드 (TSN)
+### CBS (Credit-Based Shaper) 검증
 
 ```bash
-# 8개 TC 동시 전송 (VLAN 100)
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --multi-tc 0-7:100 -r 100
+# TX: TC2, TC6 트래픽
+sudo ./tsngen eth0 -B IP -b MAC --multi-tc 2,6:100 -r 500
 
-# 특정 TC만 (0, 2, 4, 6)
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --multi-tc 0,2,4,6:100
-
-# CBS 테스트용 (TC2, TC6)
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --multi-tc 2,6:100 -r 500
+# RX: 실제 수신량 확인
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --csv cbs_results.csv
 ```
 
-### RX 통계 (손실률 측정)
+### 손실률/지연 측정
 
 ```bash
-# 같은 인터페이스에서 TX/RX 측정
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -R
+# TX: 시퀀스 + 타임스탬프
+sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 --seq --timestamp -r 500
 
-# 다른 인터페이스에서 RX (루프백 테스트)
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -R eth1
-
-# 시퀀스 번호로 패킷 손실 추적
-sudo ./trafgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -R --seq
-```
-
-### 패킷간 딜레이
-
-```bash
-# 1ms 딜레이 (패킷당) → ~1000 pps
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC -d 1ms --delay-per-pkt
-
-# 100us 딜레이 (배치당)
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC -d 100us
-```
-
-### tc/qdisc 연동
-
-```bash
-# tc qdisc 설정
-sudo tc qdisc add dev eth0 root handle 1: prio bands 8
-
-# SKB 우선순위로 트래픽 분류
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --skb-priority 6
-
-# VLAN PCP + SKB Priority (TSN)
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC -Q 6:100 --skb-priority 6
-```
-
-### 성능 최적화
-
-```bash
-# CPU 코어 고정
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --affinity
-
-# PACKET_FANOUT (멀티큐 NIC)
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --fanout=cpu
-
-# 둘 다 사용
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --affinity --fanout=cpu
+# RX: 분석
+sudo ./tsnrecv eth1 --vlan 100 --pcp 6 --seq --latency
 ```
 
 ## 출력 예시
 
-### 기본 모드
-
-```
-════════════════════════════════════════════════════════════════════════════════
- trafgen v1.4.0 - High-Performance Traffic Generator
- 16 workers, 1472 byte packets, batch 512, rate: 1000 Mbps
-════════════════════════════════════════════════════════════════════════════════
-     Time │        Packets │   Rate (pps) │      Throughput │     Errors
-──────────┼────────────────┼──────────────┼─────────────────┼────────────
-    1.0s │          84480 │        84480 │      994.9 Mbps │          0
-    2.0s │         168960 │        84480 │      994.9 Mbps │          0
-    3.0s │         253440 │        84480 │      994.9 Mbps │          0
-──────────┴────────────────┴──────────────┴─────────────────┴────────────
-
-Summary:
-  Duration:       3.00 seconds
-  TX Packets:     253440
-  TX Throughput:  0.995 Gbps
-  TX Errors:      0
-════════════════════════════════════════════════════════════════════════════════
-```
-
-### RX 모드 (손실률 측정)
-
-```
-════════════════════════════════════════════════════════════════════════════════
- trafgen v1.4.0 - High-Performance Traffic Generator
- 16 workers, 1472 byte packets, batch 512, rate: 100 Mbps | RX: eth1
-════════════════════════════════════════════════════════════════════════════════
-     Time │      TX Pkts │     TX pps │      TX Mbps │      RX Pkts │     RX pps │     Loss
-──────────┼──────────────┼────────────┼──────────────┼──────────────┼────────────┼──────────
-     1.0s │        64512 │      64506 │        759.6 │        64259 │      64253 │    0.39%
-     2.0s │       138240 │      73722 │        868.2 │       136772 │      72507 │    1.06%
-     3.0s │       211968 │      73723 │        868.2 │       209691 │      72914 │    1.07%
-──────────┴──────────────┴────────────┴──────────────┴──────────────┴────────────┴──────────
-
-Summary:
-  TX Packets:     211968
-  TX Throughput:  0.868 Gbps
-  ────────────────────────
-  RX Packets:     209691
-  RX Throughput:  0.858 Gbps
-  Packet Loss:    1.07%
-════════════════════════════════════════════════════════════════════════════════
-```
-
-### Multi-TC 모드
+### tsngen
 
 ```
 ══════════════════════════════════════════════════════════════════════════════
@@ -270,82 +164,81 @@ Summary:
 All 8 TCs completed.
 ```
 
-## TSN 테스트
+### tsnrecv (PCP 통계)
 
-### CBS (Credit-Based Shaper)
+```
+════════════════════════════════════════════════════════════════════════════════
+ tsnrecv v1.0.0 - TSN Traffic Receiver
+ Interface: eth1 | Batch: 256 | VLAN: 100
+════════════════════════════════════════════════════════════════════════════════
+    Time │      Packets │        PPS │         Mbps │ PCP0  PCP1  PCP2  PCP3  PCP4  PCP5  PCP6  PCP7
+─────────┼──────────────┼────────────┼──────────────┼─────────────────────────────────────────────────
+    1.0s │       672000 │     672000 │       7916 │ 84000 84000 84000 84000 84000 84000 84000 84000
+    2.0s │      1344000 │     672000 │       7916 │ 84000 84000 84000 84000 84000 84000 84000 84000
+─────────┴──────────────┴────────────┴──────────────┴─────────────────────────────────────────────────
 
-```bash
-# TC2, TC6 동시 테스트
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --multi-tc 2,6:100 -r 500
+Summary:
+  Duration:       2.00 seconds
+  Total Packets:  1344000
+  Avg Throughput: 7.916 Gbps
 
-# 또는 개별 실행
-sudo ./trafgen eth0 -B IP -b MAC -Q 2:100 --skb-priority 2 -r 1500 &
-sudo ./trafgen eth0 -B IP -b MAC -Q 6:100 --skb-priority 6 -r 3500 &
+  PCP Distribution:
+    PCP 0: 168000 pkts (12.5%), 988.2 Mbps avg
+    PCP 1: 168000 pkts (12.5%), 988.2 Mbps avg
+    ...
+    PCP 7: 168000 pkts (12.5%), 988.2 Mbps avg
+
+  Inter-arrival Time (us):
+    Min: 0.8
+    Avg: 1.5
+    Max: 125.3
+════════════════════════════════════════════════════════════════════════════════
 ```
 
-### TAS (Time-Aware Shaper)
+## TSN 실험 워크플로우
 
-```bash
-# 8개 TC 모두 테스트
-sudo ./trafgen eth0 -B 192.168.1.100 -b MAC --multi-tc 0-7:100 -r 100 --duration 60
 ```
-
-### mqprio qdisc 설정
-
-```bash
-# 8-queue TSN 설정 (Intel i210 등)
-sudo tc qdisc replace dev eth0 parent root handle 100 mqprio \
-    num_tc 8 \
-    map 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 \
-    queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
-    hw 0
-
-# TC별 트래픽 생성
-sudo ./trafgen eth0 -B IP -b MAC --multi-tc 0-7:100 --skb-priority 7
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   tsngen    │────▶│ TSN Switch  │────▶│  tsnrecv    │
+│    (TX)     │     │  CBS/TAS    │     │    (RX)     │
+└─────────────┘     └─────────────┘     └─────────────┘
+      │                                        │
+      │  --multi-tc 0-7:100                   │  --pcp-stats
+      │  --seq --timestamp                    │  --seq --latency
+      │  -r 100 (Mbps/TC)                     │  --csv results.csv
+      │                                        │
+      └────────────────────────────────────────┘
+              실험 결과 정량화 (CSV)
 ```
 
 ## 성능 튜닝
 
 ```bash
-# 소켓 버퍼 증가
+# 소켓 버퍼
 sudo sysctl -w net.core.wmem_max=67108864
-sudo sysctl -w net.core.wmem_default=67108864
 sudo sysctl -w net.core.rmem_max=67108864
 
 # NIC 링버퍼
 sudo ethtool -G eth0 tx 4096 rx 4096
-
-# CPU 거버너 (최대 성능)
-sudo cpupower frequency-set -g performance
-```
-
-## 파일 구조
-
-```
-traffic-generator/
-├── src/
-│   └── trafgen.c      # 메인 소스 코드
-├── mz-src/            # 원본 mz 소스 (참고용)
-├── Makefile
-└── README.md
 ```
 
 ## 버전 히스토리
 
-- **v1.4.0**: PACKET_FANOUT, CPU Affinity, RX 통계 (손실률 측정)
-- **v1.3.0**: Multi-TC 모드 (8개 TC 동시 전송)
-- **v1.2.1**: 패킷간 딜레이 (ns/us/ms 정밀도)
-- **v1.2.0**: tc/qdisc 연동 (SO_PRIORITY), VLAN DEI 지원
-- **v1.1.0**: 토큰 버킷, IP/포트 범위, TCP 플래그, 시퀀스/타임스탬프
-- **v1.0.0**: 초기 버전 (sendmmsg, 멀티스레드, VLAN PCP)
+### tsngen
+- v1.4.0: PACKET_FANOUT, CPU Affinity, RX 통계
+- v1.3.0: Multi-TC 모드
+- v1.2.x: tc 연동, VLAN DEI, 딜레이
+- v1.0.0: 초기 버전
+
+### tsnrecv
+- v1.0.0: 초기 버전 (recvmmsg, PCP 통계, 지연 분석)
 
 ## 라이선스
 
-GPLv2 (원본 Mausezahn 라이선스 준수)
+GPLv2
 
 ## 참고
 
-- [Mausezahn (mz)](https://github.com/uweber/mausezahn) - 원본 트래픽 생성기
-- [netsniff-ng](http://netsniff-ng.org/) - mz 포함 툴킷
-- [sendmmsg(2)](https://man7.org/linux/man-pages/man2/sendmmsg.2.html) - 배치 전송 시스템콜
-- [PACKET_FANOUT](https://www.kernel.org/doc/Documentation/networking/packet_mmap.txt) - 멀티큐 분산
+- [Mausezahn (mz)](https://github.com/uweber/mausezahn)
+- [IEEE 802.1Qav (CBS)](https://standards.ieee.org/)
+- [IEEE 802.1Qbv (TAS)](https://standards.ieee.org/)

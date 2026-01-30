@@ -1,5 +1,6 @@
 # Compiled binaries
-traffic_gen
+tsngen
+tsnrecv
 *.o
 *.a
 

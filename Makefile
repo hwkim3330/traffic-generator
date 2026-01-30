@@ -1,38 +1,48 @@
-# trafgen - High-Performance Traffic Generator
-# Based on Mausezahn, enhanced with sendmmsg() and multi-threading
+# TSN Traffic Generator & Receiver
+# High-performance tools for TSN (Time-Sensitive Networking) testing
 
 CC = gcc
 CFLAGS = -O3 -march=native -Wall -Wextra -pthread -D_GNU_SOURCE
 LDFLAGS = -lpthread
 
 SRCDIR = src
-TARGET = trafgen
-SOURCES = $(SRCDIR)/trafgen.c
+
+# Targets
+TSNGEN = tsngen
+TSNRECV = tsnrecv
 
 .PHONY: all clean install uninstall debug
 
-all: $(TARGET)
+all: $(TSNGEN) $(TSNRECV)
 
-$(TARGET): $(SOURCES)
+$(TSNGEN): $(SRCDIR)/tsngen.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
-	@echo ""
-	@echo "Build complete: $(TARGET)"
-	@echo "Run: sudo ./$(TARGET) --help"
+	@echo "Built: $(TSNGEN)"
+
+$(TSNRECV): $(SRCDIR)/tsnrecv.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "Built: $(TSNRECV)"
 
 debug: CFLAGS = -g -O0 -Wall -Wextra -pthread -D_GNU_SOURCE -DDEBUG
-debug: $(TARGET)
+debug: all
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TSNGEN) $(TSNRECV)
 
-install: $(TARGET)
-	install -m 755 $(TARGET) /usr/local/bin/
-	@echo "Installed to /usr/local/bin/$(TARGET)"
+install: all
+	install -m 755 $(TSNGEN) /usr/local/bin/
+	install -m 755 $(TSNRECV) /usr/local/bin/
+	@echo "Installed to /usr/local/bin/"
 
 uninstall:
-	rm -f /usr/local/bin/$(TARGET)
+	rm -f /usr/local/bin/$(TSNGEN)
+	rm -f /usr/local/bin/$(TSNRECV)
 
-# Run quick test (requires sudo)
-test: $(TARGET)
-	@echo "Quick test (dry run):"
-	sudo ./$(TARGET) lo -B 127.0.0.1 -b ff:ff:ff:ff:ff:ff -S
+# Quick test
+test-gen: $(TSNGEN)
+	@echo "tsngen dry run:"
+	sudo ./$(TSNGEN) lo -B 127.0.0.1 -b ff:ff:ff:ff:ff:ff -S
+
+test-recv: $(TSNRECV)
+	@echo "tsnrecv test (3 sec):"
+	sudo ./$(TSNRECV) lo --duration 3
