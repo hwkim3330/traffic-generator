@@ -1,9 +1,7 @@
 /*
- * txgen - High-Performance Traffic Generator v1.4.0
- * Based on Mausezahn concepts, enhanced with modern Linux networking features
+ * txgen - High-Performance Traffic Generator
  *
- * Copyright (C) 2025
- * Original Mausezahn Copyright (C) 2008-2010 Herbert Haas (GPLv2)
+ * Copyright (C) 2025 KETI (Korea Electronics Technology Institute)
  *
  * This program is free software; you can redistribute it and/or modify it under
  * the terms of the GNU General Public License version 2 as published by the
@@ -11,11 +9,10 @@
  *
  * Features:
  * - sendmmsg() batch transmission for 10Gbps+ throughput
- * - Multi-threaded architecture
- * - Precise rate limiting with token bucket
+ * - Multi-threaded architecture with lock-free rate limiting
  * - VLAN/QinQ, DSCP, TCP/UDP/ICMP support
- * - Burst mode, random payload, sequence numbers
- * - Statistics export to file
+ * - Sequence numbers and timestamps for latency measurement
+ * - PCAP replay capability
  */
 
 #define _GNU_SOURCE
@@ -821,24 +818,37 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
  * Worker Thread
  *============================================================================*/
 
+/*============================================================================
+ * Worker Thread (cleanup-safe: all error paths go through cleanup label)
+ *============================================================================*/
+
 static void *worker_thread(void *arg) {
     worker_ctx_t *ctx = (worker_ctx_t *)arg;
     config_t *cfg = ctx->cfg;
     worker_stats_t *stats = ctx->stats;
 
+    /* All resources declared at top for cleanup */
+    int sock = -1;
+    int batch = cfg->batch_size;
+
+    uint8_t **packets = NULL;
+    int *pkt_sizes = NULL;
+    struct mmsghdr *msgs = NULL;
+    struct iovec *iovecs = NULL;
+
     /* Initialize thread-local PRNG seed */
     tls_rand_init(ctx->id);
 
-    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
         perror("socket");
         return NULL;
     }
 
     int sndbuf = 64 * 1024 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    (void)setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-    /* CPU affinity (apply early) */
+    /* CPU affinity */
     if (cfg->use_affinity) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
@@ -849,8 +859,7 @@ static void *worker_thread(void *arg) {
     int ifindex = get_if_index(cfg->interface);
     if (ifindex < 0) {
         fprintf(stderr, "Failed to get interface index\n");
-        close(sock);
-        return NULL;
+        goto cleanup;
     }
 
     struct sockaddr_ll sll;
@@ -861,33 +870,30 @@ static void *worker_thread(void *arg) {
 
     if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         perror("bind");
-        close(sock);
-        return NULL;
+        goto cleanup;
     }
 
     ctx->socket_fd = sock;
 
     /* Pre-allocate packets */
-    int batch = cfg->batch_size;
-    uint8_t **packets = malloc(batch * sizeof(uint8_t *));
-    int *pkt_sizes = malloc(batch * sizeof(int));
+    packets = calloc(batch, sizeof(uint8_t *));
+    pkt_sizes = malloc(batch * sizeof(int));
+    msgs = calloc(batch, sizeof(struct mmsghdr));
+    iovecs = calloc(batch, sizeof(struct iovec));
 
-    if (!packets || !pkt_sizes) {
-        fprintf(stderr, "Worker %d: malloc failed\n", ctx->id);
-        return NULL;
+    if (!packets || !pkt_sizes || !msgs || !iovecs) {
+        fprintf(stderr, "Worker %d: alloc failed\n", ctx->id);
+        goto cleanup;
     }
 
     for (int i = 0; i < batch; i++) {
         packets[i] = aligned_alloc(64, MAX_PACKET_SIZE_ALIGNED);
         if (!packets[i]) {
-            fprintf(stderr, "Worker %d: aligned_alloc failed\n", ctx->id);
-            return NULL;
+            fprintf(stderr, "Worker %d: aligned_alloc failed at %d\n", ctx->id, i);
+            goto cleanup;
         }
         memset(packets[i], 0, MAX_PACKET_SIZE);
     }
-
-    struct mmsghdr *msgs = calloc(batch, sizeof(struct mmsghdr));
-    struct iovec *iovecs = calloc(batch, sizeof(struct iovec));
 
     uint64_t local_packets = 0;
     uint64_t local_bytes = 0;
@@ -936,14 +942,12 @@ static void *worker_thread(void *arg) {
                     local_packets++;
                     local_bytes += pkt_sizes[i];
                 }
-                /* Count unsent packets as errors (partial send = buffer/resource limits)
-                 * Note: errors counter includes both OS failures and partial sends */
                 if (sent < batch) {
                     local_errors += (batch - sent);
                 }
             } else if (sent < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    local_errors += batch;  /* All packets failed */
+                    local_errors += batch;
                 }
             }
 
@@ -979,16 +983,16 @@ static void *worker_thread(void *arg) {
     atomic_fetch_add(&stats->bytes_sent, local_bytes);
     atomic_fetch_add(&stats->errors, local_errors);
 
-    /* Cleanup */
-    for (int i = 0; i < batch; i++) {
-        free(packets[i]);
+cleanup:
+    if (packets) {
+        for (int i = 0; i < batch; i++) free(packets[i]);
     }
     free(packets);
     free(pkt_sizes);
     free(msgs);
     free(iovecs);
-    close(sock);
 
+    if (sock >= 0) close(sock);
     return NULL;
 }
 
@@ -2001,6 +2005,10 @@ int main(int argc, char *argv[]) {
 
     /* Start workers */
     worker_ctx_t *contexts = calloc(g_config.num_workers, sizeof(worker_ctx_t));
+    if (!contexts) {
+        fprintf(stderr, "Failed to allocate worker contexts\n");
+        return 1;
+    }
 
     /* Per-worker rate = total rate / num_workers */
     double worker_rate_mbps = g_config.rate_mbps > 0 ?

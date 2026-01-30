@@ -1,17 +1,19 @@
 /*
- * rxcap - Traffic Capture & Analysis Tool
- * Companion tool for txgen
+ * rxcap - High-Performance Traffic Capture & Analysis Tool
  *
- * Copyright (C) 2025
+ * Copyright (C) 2025 KETI (Korea Electronics Technology Institute)
+ *
+ * This program is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License version 2 as published by the
+ * Free Software Foundation.
  *
  * Features:
  * - recvmmsg() batch receive for 10Gbps+ capture
  * - PCAP file output (Wireshark compatible)
- * - Per-PCP/TC statistics
- * - VLAN tag parsing (PCP, DEI, VID, QinQ)
- * - Latency and inter-arrival time measurement
- * - Sequence number tracking
- * - CSV export for analysis
+ * - Per-PCP/TC statistics with atomic counters
+ * - VLAN tag parsing (802.1Q, QinQ, 802.1ad)
+ * - Latency and inter-arrival time measurement (CAS min/max)
+ * - Sequence number tracking for loss detection
  */
 
 #define _GNU_SOURCE
@@ -385,11 +387,24 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
 }
 
 /*============================================================================
- * RX Thread
+ * RX Thread (cleanup-safe: all error paths go through cleanup label)
  *============================================================================*/
 
 static void *rx_thread(void *arg) {
     config_t *cfg = (config_t *)arg;
+
+    /* All resources declared at top for cleanup */
+    int sock = -1;
+    int ifindex = -1;
+    int batch = 0;
+
+    uint8_t **buffers = NULL;
+    uint8_t **cmsg_bufs = NULL;
+    struct mmsghdr *msgs = NULL;
+    struct iovec *iovecs = NULL;
+    pcap_entry_t *pcap_entries = NULL;
+
+    size_t cmsg_size = CMSG_SPACE(sizeof(uint32_t));
 
     /* CPU affinity */
     if (cfg->use_affinity) {
@@ -400,7 +415,7 @@ static void *rx_thread(void *arg) {
         pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
     }
 
-    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
         perror("socket");
         return NULL;
@@ -408,9 +423,9 @@ static void *rx_thread(void *arg) {
 
     /* Increase receive buffer */
     int rcvbuf = 64 * 1024 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-    /* Enable SO_RXQ_OVFL to track kernel drops */
+    /* Enable SO_RXQ_OVFL */
     int ovfl_enable = 1;
     if (setsockopt(sock, SOL_SOCKET, SO_RXQ_OVFL, &ovfl_enable, sizeof(ovfl_enable)) < 0) {
         if (cfg->verbose) {
@@ -418,11 +433,10 @@ static void *rx_thread(void *arg) {
         }
     }
 
-    int ifindex = get_if_index(cfg->interface);
+    ifindex = get_if_index(cfg->interface);
     if (ifindex < 0) {
         fprintf(stderr, "Failed to get interface index for %s\n", cfg->interface);
-        close(sock);
-        return NULL;
+        goto cleanup;
     }
 
     struct sockaddr_ll sll;
@@ -433,47 +447,50 @@ static void *rx_thread(void *arg) {
 
     if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         perror("bind");
-        close(sock);
-        return NULL;
+        goto cleanup;
     }
 
-    /* Set promiscuous mode */
+    /* Promiscuous mode */
     struct packet_mreq mreq;
     memset(&mreq, 0, sizeof(mreq));
     mreq.mr_ifindex = ifindex;
     mreq.mr_type = PACKET_MR_PROMISC;
-    setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    (void)setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
     /* Allocate batch receive buffers */
-    int batch = cfg->batch_size;
-    uint8_t **buffers = malloc(batch * sizeof(uint8_t *));
-    struct mmsghdr *msgs = calloc(batch, sizeof(struct mmsghdr));
-    struct iovec *iovecs = calloc(batch, sizeof(struct iovec));
+    batch = cfg->batch_size;
+    buffers = calloc(batch, sizeof(uint8_t *));
+    cmsg_bufs = calloc(batch, sizeof(uint8_t *));
+    msgs = calloc(batch, sizeof(struct mmsghdr));
+    iovecs = calloc(batch, sizeof(struct iovec));
 
-    /* Control message buffer for SO_RXQ_OVFL */
-    size_t cmsg_size = CMSG_SPACE(sizeof(uint32_t));
-    uint8_t **cmsg_bufs = malloc(batch * sizeof(uint8_t *));
-
-    if (!buffers || !msgs || !iovecs || !cmsg_bufs) {
-        fprintf(stderr, "RX thread: malloc failed\n");
-        close(sock);
-        return NULL;
+    if (!buffers || !cmsg_bufs || !msgs || !iovecs) {
+        fprintf(stderr, "RX thread: alloc failed\n");
+        goto cleanup;
     }
 
     for (int i = 0; i < batch; i++) {
         buffers[i] = aligned_alloc(64, MAX_PACKET_SIZE_ALIGNED);
         cmsg_bufs[i] = malloc(cmsg_size);
         if (!buffers[i] || !cmsg_bufs[i]) {
-            fprintf(stderr, "RX thread: buffer alloc failed\n");
-            close(sock);
-            return NULL;
+            fprintf(stderr, "RX thread: buffer alloc failed at %d\n", i);
+            goto cleanup;
         }
+
         iovecs[i].iov_base = buffers[i];
         iovecs[i].iov_len = MAX_PACKET_SIZE;
+
         msgs[i].msg_hdr.msg_iov = &iovecs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_control = cmsg_bufs[i];
         msgs[i].msg_hdr.msg_controllen = cmsg_size;
+    }
+
+    if (g_pcap_fp) {
+        pcap_entries = malloc(batch * sizeof(pcap_entry_t));
+        if (!pcap_entries) {
+            fprintf(stderr, "Warning: PCAP buffer alloc failed, disabling PCAP\n");
+        }
     }
 
     parsed_packet_t pkt;
@@ -481,19 +498,7 @@ static void *rx_thread(void *arg) {
     uint64_t local_bytes = 0;
     uint64_t last_drop_count = 0;
 
-    /* PCAP batch buffer
-     * NOTE: entries[].data points to buffers[] which remain valid until next recvmmsg cycle */
-    pcap_entry_t *pcap_entries = NULL;
-    if (g_pcap_fp) {
-        pcap_entries = malloc(batch * sizeof(pcap_entry_t));
-        if (!pcap_entries) {
-            fprintf(stderr, "Warning: PCAP buffer alloc failed, disabling PCAP\n");
-            /* pcap_entries stays NULL, pcap writes will be skipped */
-        }
-    }
-
     while (g_running) {
-        /* Reset control message lengths */
         for (int i = 0; i < batch; i++) {
             msgs[i].msg_hdr.msg_controllen = cmsg_size;
         }
@@ -501,16 +506,16 @@ static void *rx_thread(void *arg) {
         int received = recvmmsg(sock, msgs, batch, MSG_DONTWAIT, NULL);
 
         if (received > 0) {
-            int pcap_count = 0;  /* Number of packets to write to pcap */
+            int pcap_count = 0;
 
             for (int i = 0; i < received; i++) {
-                uint64_t now_ns = get_time_ns();  /* Per-packet timestamp */
+                uint64_t now_ns = get_time_ns();
                 int len = msgs[i].msg_len;
                 uint8_t *buf = buffers[i];
 
-                /* Check for dropped packets from SO_RXQ_OVFL */
-                struct cmsghdr *cmsg;
-                for (cmsg = CMSG_FIRSTHDR(&msgs[i].msg_hdr); cmsg != NULL;
+                /* SO_RXQ_OVFL drop detection */
+                for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msgs[i].msg_hdr);
+                     cmsg != NULL;
                      cmsg = CMSG_NXTHDR(&msgs[i].msg_hdr, cmsg)) {
                     if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_RXQ_OVFL) {
                         uint32_t drop_count;
@@ -524,21 +529,14 @@ static void *rx_thread(void *arg) {
 
                 if (parse_packet(buf, len, &pkt) < 0) continue;
 
-                /* Apply filters */
-                if (cfg->filter_vlan && (!pkt.has_vlan || pkt.vlan_id != cfg->vlan_id)) {
-                    continue;
-                }
-                if (cfg->filter_pcp && (!pkt.has_vlan || pkt.pcp != cfg->pcp)) {
-                    continue;
-                }
-                if (cfg->seq_only && !pkt.has_seq) {
-                    continue;  /* Skip packets without seq header */
-                }
+                /* Filters */
+                if (cfg->filter_vlan && (!pkt.has_vlan || pkt.vlan_id != cfg->vlan_id)) continue;
+                if (cfg->filter_pcp && (!pkt.has_vlan || pkt.pcp != cfg->pcp)) continue;
+                if (cfg->seq_only && !pkt.has_seq) continue;
 
                 local_packets++;
                 local_bytes += len;
 
-                /* Queue for pcap batch write */
                 if (pcap_entries) {
                     pcap_entries[pcap_count].data = buf;
                     pcap_entries[pcap_count].len = len;
@@ -546,23 +544,20 @@ static void *rx_thread(void *arg) {
                     pcap_count++;
                 }
 
-                /* Update PCP stats */
+                /* VLAN / PCP stats */
                 if (pkt.has_vlan) {
                     atomic_fetch_add(&g_stats.vlan_packets, 1);
                     atomic_fetch_add(&g_stats.pcp[pkt.pcp].packets, 1);
                     atomic_fetch_add(&g_stats.pcp[pkt.pcp].bytes, len);
 
-                    /* Per-PCP sequence tracking (for Multi-TC mode) */
                     if (cfg->check_seq && pkt.has_seq) {
                         pcp_stats_t *pcp_stat = &g_stats.pcp[pkt.pcp];
                         if (pcp_stat->last_seq != 0) {
-                            /* Detect wraparound/restart: seq decreased by >50% of range */
                             if (pkt.seq_num < pcp_stat->last_seq &&
                                 (pcp_stat->last_seq - pkt.seq_num) > 0x80000000U) {
-                                /* Likely wraparound, not an error */
+                                /* wraparound */
                             } else if (pkt.seq_num < pcp_stat->last_seq) {
-                                /* Sequence restarted - reset tracking */
-                                pcp_stat->last_seq = 0;
+                                pcp_stat->last_seq = 0;  /* restart */
                             } else if (pkt.seq_num == pcp_stat->last_seq) {
                                 atomic_fetch_add(&pcp_stat->seq_duplicates, 1);
                             } else if (pkt.seq_num != pcp_stat->last_seq + 1) {
@@ -574,10 +569,8 @@ static void *rx_thread(void *arg) {
                 } else {
                     atomic_fetch_add(&g_stats.non_vlan_packets, 1);
 
-                    /* Sequence tracking (atomic for stats_thread safety) */
                     if (cfg->check_seq && pkt.has_seq) {
                         if (atomic_load(&g_stats.seq_started) == 0) {
-                            /* First packet: set both first and last */
                             atomic_store(&g_stats.first_seq, pkt.seq_num);
                             atomic_store(&g_stats.last_seq, pkt.seq_num);
                             atomic_store(&g_stats.seq_started, 1);
@@ -593,49 +586,40 @@ static void *rx_thread(void *arg) {
                     }
                 }
 
-                /* Latency measurement (if timestamp present) */
+                /* Latency */
                 if (cfg->measure_latency && pkt.has_timestamp) {
                     uint64_t latency = now_ns - pkt.timestamp;
                     atomic_fetch_add(&g_stats.latency_sum, latency);
                     atomic_fetch_add(&g_stats.latency_count, 1);
 
-                    /* CAS loop for min (cur updated by CAS on failure) */
                     uint64_t cur = atomic_load(&g_stats.latency_min);
                     while (cur == 0 || latency < cur) {
-                        if (atomic_compare_exchange_weak(&g_stats.latency_min, &cur, latency))
-                            break;
+                        if (atomic_compare_exchange_weak(&g_stats.latency_min, &cur, latency)) break;
                     }
-                    /* CAS loop for max */
                     cur = atomic_load(&g_stats.latency_max);
                     while (latency > cur) {
-                        if (atomic_compare_exchange_weak(&g_stats.latency_max, &cur, latency))
-                            break;
+                        if (atomic_compare_exchange_weak(&g_stats.latency_max, &cur, latency)) break;
                     }
                 }
 
-                /* Inter-arrival time */
+                /* IAT */
                 if (g_stats.last_arrival_ns > 0) {
                     uint64_t iat = now_ns - g_stats.last_arrival_ns;
                     atomic_fetch_add(&g_stats.iat_sum, iat);
                     atomic_fetch_add(&g_stats.iat_count, 1);
 
-                    /* CAS loop for min (cur updated by CAS on failure) */
                     uint64_t cur = atomic_load(&g_stats.iat_min);
                     while (cur == 0 || iat < cur) {
-                        if (atomic_compare_exchange_weak(&g_stats.iat_min, &cur, iat))
-                            break;
+                        if (atomic_compare_exchange_weak(&g_stats.iat_min, &cur, iat)) break;
                     }
-                    /* CAS loop for max */
                     cur = atomic_load(&g_stats.iat_max);
                     while (iat > cur) {
-                        if (atomic_compare_exchange_weak(&g_stats.iat_max, &cur, iat))
-                            break;
+                        if (atomic_compare_exchange_weak(&g_stats.iat_max, &cur, iat)) break;
                     }
                 }
                 g_stats.last_arrival_ns = now_ns;
             }
 
-            /* Batch write to pcap (single lock acquisition per batch) */
             if (pcap_entries && pcap_count > 0) {
                 pcap_write_batch(pcap_entries, pcap_count);
             }
@@ -644,33 +628,28 @@ static void *rx_thread(void *arg) {
             atomic_fetch_add(&g_stats.total_bytes, local_bytes);
             local_packets = 0;
             local_bytes = 0;
-        } else if (received == 0) {
-            /* No packets available - avoid busy spin */
+        } else if (received == 0 || (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
             struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
             nanosleep(&ts, NULL);
-        } else {  /* received < 0 */
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Avoid busy spin - sleep 100us */
-                struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
-                nanosleep(&ts, NULL);
-            } else {
-                if (g_running) perror("recvmmsg");
-            }
+        } else if (received < 0) {
+            if (g_running) perror("recvmmsg");
         }
     }
 
-    /* Cleanup */
-    for (int i = 0; i < batch; i++) {
-        free(buffers[i]);
-        free(cmsg_bufs[i]);
+cleanup:
+    if (buffers) {
+        for (int i = 0; i < batch; i++) free(buffers[i]);
+    }
+    if (cmsg_bufs) {
+        for (int i = 0; i < batch; i++) free(cmsg_bufs[i]);
     }
     free(buffers);
     free(cmsg_bufs);
     free(msgs);
-    free(pcap_entries);
     free(iovecs);
-    close(sock);
+    free(pcap_entries);
 
+    if (sock >= 0) close(sock);
     return NULL;
 }
 
