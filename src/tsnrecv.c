@@ -1,5 +1,5 @@
 /*
- * tsnrecv - High-Performance TSN Traffic Receiver v1.0.0
+ * tsnrecv - High-Performance TSN Traffic Receiver v1.1.0
  * Companion tool for tsngen - measures TSN traffic characteristics
  *
  * Copyright (C) 2025
@@ -37,12 +37,18 @@
 #include <netinet/udp.h>
 #include <netpacket/packet.h>
 #include <linux/if_ether.h>
+#include <sched.h>
+
+/* SO_RXQ_OVFL for drop detection (if not defined) */
+#ifndef SO_RXQ_OVFL
+#define SO_RXQ_OVFL 40
+#endif
 
 /*============================================================================
  * Constants
  *============================================================================*/
 
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_BATCH_SIZE 256
 #define STATS_INTERVAL_US 1000000
@@ -57,6 +63,10 @@
 typedef struct {
     atomic_uint_fast64_t packets;
     atomic_uint_fast64_t bytes;
+    /* Per-PCP sequence tracking */
+    uint32_t last_seq;
+    atomic_uint_fast64_t seq_errors;
+    atomic_uint_fast64_t seq_duplicates;
 } pcp_stats_t;
 
 /* Global configuration */
@@ -80,6 +90,10 @@ typedef struct {
     int verbose;
     int quiet;
     int show_pcp_stats;
+
+    /* Performance */
+    int use_affinity;
+    int affinity_cpu;
 } config_t;
 
 /* Global statistics */
@@ -90,12 +104,15 @@ typedef struct {
     atomic_uint_fast64_t non_vlan_packets;
     pcp_stats_t pcp[MAX_PCP];
 
-    /* Sequence tracking */
+    /* Kernel/socket drops (from SO_RXQ_OVFL) */
+    atomic_uint_fast64_t kernel_drops;
+
+    /* Global sequence tracking (for single-TC mode) */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
     uint32_t last_seq;
 
-    /* Latency (if timestamp in packet) */
+    /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
     uint64_t latency_sum;
     uint64_t latency_count;
     uint64_t latency_min;
@@ -134,9 +151,16 @@ static void signal_handler(int sig) {
  * Utility Functions
  *============================================================================*/
 
+/*
+ * Timestamp policy:
+ * - Uses CLOCK_MONOTONIC_RAW for latency measurement
+ * - This clock is not subject to NTP adjustments
+ * - tsngen must also use CLOCK_MONOTONIC_RAW for accurate latency
+ * - For cross-machine latency, use PTP-synced HW timestamps instead
+ */
 static inline uint64_t get_time_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
@@ -161,12 +185,19 @@ static int get_if_index(const char *ifname) {
  * Packet Parsing
  *============================================================================*/
 
+/*
+ * TSN Payload Header (12 bytes):
+ * - Bytes 0-3:  Sequence number (network order)
+ * - Bytes 4-11: Timestamp (CLOCK_MONOTONIC_RAW ns, host order)
+ *
+ * For Multi-TC mode, PCP is used as flow_id for per-PCP sequence tracking.
+ */
 typedef struct {
     uint8_t src_mac[6];
     uint8_t dst_mac[6];
     int has_vlan;
     uint16_t vlan_id;
-    uint8_t pcp;
+    uint8_t pcp;        /* Also used as flow_id for per-PCP seq tracking */
     uint8_t dei;
     uint16_t ethertype;
     int payload_offset;
@@ -242,6 +273,15 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
 static void *rx_thread(void *arg) {
     config_t *cfg = (config_t *)arg;
 
+    /* CPU affinity */
+    if (cfg->use_affinity) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        int cpu = cfg->affinity_cpu >= 0 ? cfg->affinity_cpu : 0;
+        CPU_SET(cpu % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    }
+
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
         perror("socket");
@@ -251,6 +291,14 @@ static void *rx_thread(void *arg) {
     /* Increase receive buffer */
     int rcvbuf = 64 * 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    /* Enable SO_RXQ_OVFL to track kernel drops */
+    int ovfl_enable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_RXQ_OVFL, &ovfl_enable, sizeof(ovfl_enable)) < 0) {
+        if (cfg->verbose) {
+            fprintf(stderr, "Warning: SO_RXQ_OVFL not supported, drop counting disabled\n");
+        }
+    }
 
     int ifindex = get_if_index(cfg->interface);
     if (ifindex < 0) {
@@ -284,19 +332,32 @@ static void *rx_thread(void *arg) {
     struct mmsghdr *msgs = calloc(batch, sizeof(struct mmsghdr));
     struct iovec *iovecs = calloc(batch, sizeof(struct iovec));
 
+    /* Control message buffer for SO_RXQ_OVFL */
+    size_t cmsg_size = CMSG_SPACE(sizeof(uint32_t));
+    uint8_t **cmsg_bufs = malloc(batch * sizeof(uint8_t *));
+
     for (int i = 0; i < batch; i++) {
         buffers[i] = aligned_alloc(64, MAX_PACKET_SIZE);
+        cmsg_bufs[i] = malloc(cmsg_size);
         iovecs[i].iov_base = buffers[i];
         iovecs[i].iov_len = MAX_PACKET_SIZE;
         msgs[i].msg_hdr.msg_iov = &iovecs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_control = cmsg_bufs[i];
+        msgs[i].msg_hdr.msg_controllen = cmsg_size;
     }
 
     parsed_packet_t pkt;
     uint64_t local_packets = 0;
     uint64_t local_bytes = 0;
+    uint64_t last_drop_count = 0;
 
     while (g_running) {
+        /* Reset control message lengths */
+        for (int i = 0; i < batch; i++) {
+            msgs[i].msg_hdr.msg_controllen = cmsg_size;
+        }
+
         int received = recvmmsg(sock, msgs, batch, MSG_DONTWAIT, NULL);
 
         if (received > 0) {
@@ -305,6 +366,20 @@ static void *rx_thread(void *arg) {
             for (int i = 0; i < received; i++) {
                 int len = msgs[i].msg_len;
                 uint8_t *buf = buffers[i];
+
+                /* Check for dropped packets from SO_RXQ_OVFL */
+                struct cmsghdr *cmsg;
+                for (cmsg = CMSG_FIRSTHDR(&msgs[i].msg_hdr); cmsg != NULL;
+                     cmsg = CMSG_NXTHDR(&msgs[i].msg_hdr, cmsg)) {
+                    if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_RXQ_OVFL) {
+                        uint32_t drop_count;
+                        memcpy(&drop_count, CMSG_DATA(cmsg), sizeof(drop_count));
+                        if (drop_count > last_drop_count) {
+                            atomic_fetch_add(&g_stats.kernel_drops, drop_count - last_drop_count);
+                            last_drop_count = drop_count;
+                        }
+                    }
+                }
 
                 if (parse_packet(buf, len, &pkt) < 0) continue;
 
@@ -324,20 +399,33 @@ static void *rx_thread(void *arg) {
                     atomic_fetch_add(&g_stats.vlan_packets, 1);
                     atomic_fetch_add(&g_stats.pcp[pkt.pcp].packets, 1);
                     atomic_fetch_add(&g_stats.pcp[pkt.pcp].bytes, len);
+
+                    /* Per-PCP sequence tracking (for Multi-TC mode) */
+                    if (cfg->check_seq && pkt.has_seq) {
+                        pcp_stats_t *pcp_stat = &g_stats.pcp[pkt.pcp];
+                        if (pcp_stat->last_seq != 0) {
+                            if (pkt.seq_num == pcp_stat->last_seq) {
+                                atomic_fetch_add(&pcp_stat->seq_duplicates, 1);
+                            } else if (pkt.seq_num != pcp_stat->last_seq + 1) {
+                                atomic_fetch_add(&pcp_stat->seq_errors, 1);
+                            }
+                        }
+                        pcp_stat->last_seq = pkt.seq_num;
+                    }
                 } else {
                     atomic_fetch_add(&g_stats.non_vlan_packets, 1);
-                }
 
-                /* Sequence number tracking */
-                if (cfg->check_seq && pkt.has_seq) {
-                    if (g_stats.last_seq != 0) {
-                        if (pkt.seq_num == g_stats.last_seq) {
-                            atomic_fetch_add(&g_stats.seq_duplicates, 1);
-                        } else if (pkt.seq_num != g_stats.last_seq + 1) {
-                            atomic_fetch_add(&g_stats.seq_errors, 1);
+                    /* Global sequence tracking (for non-VLAN mode) */
+                    if (cfg->check_seq && pkt.has_seq) {
+                        if (g_stats.last_seq != 0) {
+                            if (pkt.seq_num == g_stats.last_seq) {
+                                atomic_fetch_add(&g_stats.seq_duplicates, 1);
+                            } else if (pkt.seq_num != g_stats.last_seq + 1) {
+                                atomic_fetch_add(&g_stats.seq_errors, 1);
+                            }
                         }
+                        g_stats.last_seq = pkt.seq_num;
                     }
-                    g_stats.last_seq = pkt.seq_num;
                 }
 
                 /* Latency measurement (if timestamp present) */
@@ -380,8 +468,10 @@ static void *rx_thread(void *arg) {
     /* Cleanup */
     for (int i = 0; i < batch; i++) {
         free(buffers[i]);
+        free(cmsg_bufs[i]);
     }
     free(buffers);
+    free(cmsg_bufs);
     free(msgs);
     free(iovecs);
     close(sock);
@@ -398,22 +488,24 @@ static void *stats_thread(void *arg) {
 
     if (!cfg->quiet) {
         printf("\n");
-        printf("════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+        printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
         printf(" tsnrecv v%s - TSN Traffic Receiver\n", VERSION);
         printf(" Interface: %s | Batch: %d", cfg->interface, cfg->batch_size);
         if (cfg->filter_vlan) printf(" | VLAN: %d", cfg->vlan_id);
         if (cfg->filter_pcp) printf(" | PCP: %d", cfg->pcp);
+        if (cfg->use_affinity) printf(" | CPU: %d", cfg->affinity_cpu >= 0 ? cfg->affinity_cpu : 0);
         printf("\n");
-        printf("════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+        printf(" Clock: CLOCK_MONOTONIC_RAW (for latency measurement)\n");
+        printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
 
         if (cfg->show_pcp_stats) {
-            printf(" %7s │ %12s │ %10s │ %12s │ %8s %8s %8s %8s %8s %8s %8s %8s\n",
-                   "Time", "Packets", "PPS", "Mbps", "PCP0", "PCP1", "PCP2", "PCP3", "PCP4", "PCP5", "PCP6", "PCP7");
-            printf("─────────┼──────────────┼────────────┼──────────────┼─────────────────────────────────────────────────────────────────────\n");
+            printf(" %7s │ %12s │ %10s │ %10s │ %6s │ %7s %7s %7s %7s %7s %7s %7s %7s\n",
+                   "Time", "Packets", "PPS", "Mbps", "Drops", "PCP0", "PCP1", "PCP2", "PCP3", "PCP4", "PCP5", "PCP6", "PCP7");
+            printf("─────────┼──────────────┼────────────┼────────────┼────────┼───────────────────────────────────────────────────────────────────\n");
         } else {
-            printf(" %7s │ %12s │ %10s │ %12s │ %10s │ %10s\n",
-                   "Time", "Packets", "PPS", "Mbps", "VLAN", "Non-VLAN");
-            printf("─────────┼──────────────┼────────────┼──────────────┼────────────┼────────────\n");
+            printf(" %7s │ %12s │ %10s │ %10s │ %6s │ %10s │ %10s\n",
+                   "Time", "Packets", "PPS", "Mbps", "Drops", "VLAN", "Non-VLAN");
+            printf("─────────┼──────────────┼────────────┼────────────┼────────┼────────────┼────────────\n");
         }
     }
 
@@ -437,6 +529,7 @@ static void *stats_thread(void *arg) {
         uint64_t total_bytes = atomic_load(&g_stats.total_bytes);
         uint64_t vlan_packets = atomic_load(&g_stats.vlan_packets);
         uint64_t non_vlan_packets = atomic_load(&g_stats.non_vlan_packets);
+        uint64_t kernel_drops = atomic_load(&g_stats.kernel_drops);
 
         uint64_t delta_packets = total_packets - last_packets;
         uint64_t delta_bytes = total_bytes - last_bytes;
@@ -446,8 +539,8 @@ static void *stats_thread(void *arg) {
 
         if (!cfg->quiet) {
             if (cfg->show_pcp_stats) {
-                printf(" %6.1fs │ %12lu │ %10.0f │ %10.1f │",
-                       elapsed, total_packets, pps, mbps);
+                printf(" %6.1fs │ %12lu │ %10.0f │ %10.1f │ %6lu │",
+                       elapsed, total_packets, pps, mbps, kernel_drops);
                 for (int p = 0; p < MAX_PCP; p++) {
                     uint64_t pcp_pkts = atomic_load(&g_stats.pcp[p].packets);
                     uint64_t delta_pcp = pcp_pkts - last_pcp[p];
@@ -456,21 +549,34 @@ static void *stats_thread(void *arg) {
                 }
                 printf("\n");
             } else {
-                printf(" %6.1fs │ %12lu │ %10.0f │ %10.1f │ %10lu │ %10lu\n",
-                       elapsed, total_packets, pps, mbps, vlan_packets, non_vlan_packets);
+                printf(" %6.1fs │ %12lu │ %10.0f │ %10.1f │ %6lu │ %10lu │ %10lu\n",
+                       elapsed, total_packets, pps, mbps, kernel_drops, vlan_packets, non_vlan_packets);
             }
             fflush(stdout);
         }
 
-        /* Write to CSV */
+        /* Write to CSV - standardized schema */
         if (g_csv_fp) {
-            fprintf(g_csv_fp, "%.1f,%lu,%lu,%.0f,%.2f,%lu,%lu",
-                    elapsed, total_packets, total_bytes, pps, mbps,
-                    vlan_packets, non_vlan_packets);
+            /* Latency stats */
+            uint64_t lat_min = g_stats.latency_min;
+            uint64_t lat_max = g_stats.latency_max;
+            double lat_avg = g_stats.latency_count > 0 ?
+                (double)g_stats.latency_sum / g_stats.latency_count : 0;
+
+            /* IAT stats */
+            uint64_t iat_min = g_stats.iat_min;
+            uint64_t iat_max = g_stats.iat_max;
+            double iat_avg = g_stats.iat_count > 0 ?
+                (double)g_stats.iat_sum / g_stats.iat_count : 0;
+
+            fprintf(g_csv_fp, "%.3f,%lu,%.0f,%.3f,%lu",
+                    elapsed, total_packets, pps, mbps, kernel_drops);
             for (int p = 0; p < MAX_PCP; p++) {
                 fprintf(g_csv_fp, ",%lu", atomic_load(&g_stats.pcp[p].packets));
             }
-            fprintf(g_csv_fp, "\n");
+            fprintf(g_csv_fp, ",%lu,%.0f,%lu,%lu,%.0f,%lu\n",
+                    lat_min, lat_avg, lat_max,
+                    iat_min, iat_avg, iat_max);
             fflush(g_csv_fp);
         }
 
@@ -492,12 +598,13 @@ static void *stats_thread(void *arg) {
 
     uint64_t total_packets = atomic_load(&g_stats.total_packets);
     uint64_t total_bytes = atomic_load(&g_stats.total_bytes);
+    uint64_t kernel_drops = atomic_load(&g_stats.kernel_drops);
 
     if (!cfg->quiet) {
         if (cfg->show_pcp_stats) {
-            printf("─────────┴──────────────┴────────────┴──────────────┴─────────────────────────────────────────────────────────────────────\n\n");
+            printf("─────────┴──────────────┴────────────┴────────────┴────────┴───────────────────────────────────────────────────────────────────\n\n");
         } else {
-            printf("─────────┴──────────────┴────────────┴──────────────┴────────────┴────────────\n\n");
+            printf("─────────┴──────────────┴────────────┴────────────┴────────┴────────────┴────────────\n\n");
         }
 
         printf("Summary:\n");
@@ -506,6 +613,7 @@ static void *stats_thread(void *arg) {
         printf("  Total Data:     %.3f GB\n", total_bytes / (1024.0 * 1024.0 * 1024.0));
         printf("  Avg Rate:       %.0f pps\n", total_packets / total_time);
         printf("  Avg Throughput: %.3f Gbps\n", (total_bytes * 8.0) / (total_time * 1e9));
+        printf("  Kernel Drops:   %lu (SO_RXQ_OVFL)\n", kernel_drops);
 
         /* VLAN/PCP breakdown */
         uint64_t vlan_pkts = atomic_load(&g_stats.vlan_packets);
@@ -515,26 +623,32 @@ static void *stats_thread(void *arg) {
         printf("  Non-VLAN:       %lu (%.1f%%)\n", nonvlan_pkts,
                total_packets > 0 ? 100.0 * nonvlan_pkts / total_packets : 0);
 
-        /* PCP distribution */
+        /* PCP distribution with per-PCP sequence tracking */
         if (vlan_pkts > 0) {
             printf("\n  PCP Distribution:\n");
             for (int p = 0; p < MAX_PCP; p++) {
                 uint64_t pcp_pkts = atomic_load(&g_stats.pcp[p].packets);
                 if (pcp_pkts > 0) {
                     uint64_t pcp_bytes = atomic_load(&g_stats.pcp[p].bytes);
-                    printf("    PCP %d: %lu pkts (%.1f%%), %.2f Mbps avg\n",
+                    uint64_t pcp_seq_err = atomic_load(&g_stats.pcp[p].seq_errors);
+                    uint64_t pcp_seq_dup = atomic_load(&g_stats.pcp[p].seq_duplicates);
+                    printf("    PCP %d: %lu pkts (%.1f%%), %.2f Mbps avg",
                            p, pcp_pkts,
                            100.0 * pcp_pkts / vlan_pkts,
                            (pcp_bytes * 8.0) / (total_time * 1e6));
+                    if (cfg->check_seq && (pcp_seq_err > 0 || pcp_seq_dup > 0)) {
+                        printf(" [seq_err:%lu dup:%lu]", pcp_seq_err, pcp_seq_dup);
+                    }
+                    printf("\n");
                 }
             }
         }
 
-        /* Sequence analysis */
-        if (cfg->check_seq) {
+        /* Global sequence analysis (for non-VLAN traffic) */
+        if (cfg->check_seq && nonvlan_pkts > 0) {
             uint64_t seq_errors = atomic_load(&g_stats.seq_errors);
             uint64_t seq_dups = atomic_load(&g_stats.seq_duplicates);
-            printf("\n  Sequence Analysis:\n");
+            printf("\n  Sequence Analysis (non-VLAN):\n");
             printf("    Out-of-order: %lu\n", seq_errors);
             printf("    Duplicates:   %lu\n", seq_dups);
         }
@@ -542,7 +656,7 @@ static void *stats_thread(void *arg) {
         /* Latency stats */
         if (cfg->measure_latency && g_stats.latency_count > 0) {
             double avg_lat = (double)g_stats.latency_sum / g_stats.latency_count / 1000.0;
-            printf("\n  Latency (us):\n");
+            printf("\n  Latency (us) [CLOCK_MONOTONIC_RAW]:\n");
             printf("    Min: %.1f\n", g_stats.latency_min / 1000.0);
             printf("    Avg: %.1f\n", avg_lat);
             printf("    Max: %.1f\n", g_stats.latency_max / 1000.0);
@@ -557,7 +671,7 @@ static void *stats_thread(void *arg) {
             printf("    Max: %.1f\n", g_stats.iat_max / 1000.0);
         }
 
-        printf("════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+        printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
     }
 
     return NULL;
@@ -574,32 +688,54 @@ static void print_usage(const char *prog) {
     printf("\n");
     printf("Usage: %s [options] <interface>\n", prog);
     printf("\n");
-    printf("Options:\n");
+    printf("Filter:\n");
     printf("  --vlan VID               Filter by VLAN ID\n");
     printf("  --pcp NUM                Filter by PCP (0-7)\n");
+    printf("\n");
+    printf("Capture:\n");
     printf("  --duration SEC           Capture duration (0=infinite)\n");
     printf("  --batch NUM              Batch size (default: 256)\n");
-    printf("  --seq                    Track sequence numbers\n");
+    printf("\n");
+    printf("Analysis:\n");
+    printf("  --seq                    Track sequence numbers (per-PCP for VLAN traffic)\n");
     printf("  --latency                Measure latency (requires tsngen --timestamp)\n");
     printf("  --pcp-stats              Show per-PCP statistics\n");
-    printf("  --csv FILE               Write CSV output\n");
+    printf("\n");
+    printf("Performance:\n");
+    printf("  --affinity[=CPU]         Pin RX thread to CPU core (default: 0)\n");
+    printf("\n");
+    printf("Output:\n");
+    printf("  --csv FILE               Write CSV output (standardized schema)\n");
     printf("  -q, --quiet              Quiet mode\n");
     printf("  -v, --verbose            Verbose output\n");
     printf("  -h, --help               Show help\n");
     printf("  --version                Show version\n");
     printf("\n");
+    printf("Clock Policy:\n");
+    printf("  - Uses CLOCK_MONOTONIC_RAW for latency measurement\n");
+    printf("  - tsngen must also use --timestamp for latency to work\n");
+    printf("  - Both tools must run on the same machine for accurate latency\n");
+    printf("\n");
+    printf("Drop Detection:\n");
+    printf("  - Uses SO_RXQ_OVFL to detect kernel/socket drops\n");
+    printf("  - Drops shown in real-time stats and summary\n");
+    printf("  - Non-zero drops indicate receiver bottleneck\n");
+    printf("\n");
+    printf("CSV Schema:\n");
+    printf("  time_s, total_pkts, total_pps, total_mbps, drops,\n");
+    printf("  pcp0_pkts..pcp7_pkts,\n");
+    printf("  latency_min_ns, latency_avg_ns, latency_max_ns,\n");
+    printf("  iat_min_ns, iat_avg_ns, iat_max_ns\n");
+    printf("\n");
     printf("Examples:\n");
     printf("  # Capture all traffic on eth0 for 60 seconds\n");
     printf("  sudo %s eth0 --duration 60\n", prog);
     printf("\n");
-    printf("  # Capture VLAN 100 traffic with PCP stats\n");
-    printf("  sudo %s eth0 --vlan 100 --pcp-stats\n", prog);
-    printf("\n");
-    printf("  # Filter PCP 6 and save to CSV\n");
-    printf("  sudo %s eth0 --pcp 6 --csv results.csv\n", prog);
+    printf("  # Capture VLAN 100 traffic with PCP stats and CPU pinning\n");
+    printf("  sudo %s eth0 --vlan 100 --pcp-stats --affinity=2\n", prog);
     printf("\n");
     printf("  # Full TSN analysis with tsngen\n");
-    printf("  # Terminal 1 (RX):  sudo %s eth1 --vlan 100 --seq --latency --pcp-stats\n", prog);
+    printf("  # Terminal 1 (RX):  sudo %s eth1 --vlan 100 --seq --latency --pcp-stats --csv results.csv\n", prog);
     printf("  # Terminal 2 (TX):  sudo tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 --seq --timestamp\n");
     printf("\n");
 }
@@ -622,6 +758,7 @@ int main(int argc, char *argv[]) {
         {"latency",   no_argument,       0, 1006},
         {"pcp-stats", no_argument,       0, 1007},
         {"csv",       required_argument, 0, 1008},
+        {"affinity",  optional_argument, 0, 1009},
         {"quiet",     no_argument,       0, 'q'},
         {"verbose",   no_argument,       0, 'v'},
         {"help",      no_argument,       0, 'h'},
@@ -649,6 +786,10 @@ int main(int argc, char *argv[]) {
             case 1008:
                 strncpy(g_config.csv_file, optarg, sizeof(g_config.csv_file) - 1);
                 break;
+            case 1009:
+                g_config.use_affinity = 1;
+                g_config.affinity_cpu = optarg ? atoi(optarg) : 0;
+                break;
             case 'q': g_config.quiet = 1; break;
             case 'v': g_config.verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
@@ -671,15 +812,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Open CSV file */
+    /* Open CSV file - standardized schema */
     if (strlen(g_config.csv_file) > 0) {
         g_csv_fp = fopen(g_config.csv_file, "w");
         if (g_csv_fp) {
-            fprintf(g_csv_fp, "time,packets,bytes,pps,mbps,vlan_pkts,nonvlan_pkts");
+            fprintf(g_csv_fp, "time_s,total_pkts,total_pps,total_mbps,drops");
             for (int p = 0; p < MAX_PCP; p++) {
-                fprintf(g_csv_fp, ",pcp%d", p);
+                fprintf(g_csv_fp, ",pcp%d_pkts", p);
             }
-            fprintf(g_csv_fp, "\n");
+            fprintf(g_csv_fp, ",latency_min_ns,latency_avg_ns,latency_max_ns");
+            fprintf(g_csv_fp, ",iat_min_ns,iat_avg_ns,iat_max_ns\n");
         }
     }
 

@@ -71,7 +71,7 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.4.0"
+#define VERSION "1.5.0"
 #define MAX_PACKET_SIZE 9000
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
@@ -136,6 +136,7 @@ typedef struct {
     uint8_t multi_tc[8];    /* TC list to use */
     int multi_tc_count;     /* Number of TCs */
     uint16_t multi_tc_vlan; /* Base VLAN ID for multi-TC */
+    int rate_per_tc;        /* 1 = rate is per TC, 0 = rate is total (split across TCs) */
 
     /* Layer 3 */
     char src_ip[INET6_ADDRSTRLEN];
@@ -293,9 +294,15 @@ static void signal_handler(int sig) {
  * Utility Functions
  *============================================================================*/
 
+/*
+ * Timestamp policy:
+ * - Uses CLOCK_MONOTONIC_RAW for timestamp (not subject to NTP)
+ * - tsnrecv must also use CLOCK_MONOTONIC_RAW for accurate latency
+ * - For cross-machine latency, use PTP-synced HW timestamps
+ */
 static inline uint64_t get_time_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
@@ -1230,6 +1237,8 @@ static void print_usage(const char *prog) {
     printf("  --multi-tc TC_SPEC[:VLAN]  Send to multiple TCs simultaneously\n");
     printf("                           TC_SPEC: 0-7, 0,2,4,6, or 0-3,6-7\n");
     printf("                           Example: --multi-tc 0-7:100\n");
+    printf("  --rate-per-tc              Rate is per-TC (default for multi-TC)\n");
+    printf("                           Without this flag in multi-TC: rate is total, split across TCs\n");
     printf("\n");
     printf("Performance:\n");
     printf("  --fanout[=MODE]          PACKET_FANOUT for multi-queue (hash,lb,cpu,rnd)\n");
@@ -1443,6 +1452,7 @@ int main(int argc, char *argv[]) {
         {"tcp-win",       required_argument, 0, 1011},
         {"skb-priority",  required_argument, 0, 1015},
         {"multi-tc",      required_argument, 0, 1017},
+        {"rate-per-tc",   no_argument,       0, 1025},
         {"fanout",        optional_argument, 0, 1018},
         {"affinity",      no_argument,       0, 1019},
         {"rx",            optional_argument, 0, 'R'},
@@ -1646,6 +1656,7 @@ int main(int argc, char *argv[]) {
             case 1022: g_config.add_timestamp = 1; break;
             case 1023: g_config.calc_ip_csum = 1; break;
             case 1024: g_config.calc_l4_csum = 1; break;
+            case 1025: g_config.rate_per_tc = 1; break;
             case 'q': g_config.quiet = 1; break;
             case 'v': g_config.verbose = 1; break;
             case 'S': g_config.simulation = 1; break;
@@ -1761,13 +1772,22 @@ int main(int argc, char *argv[]) {
         int num_tc = g_config.multi_tc_count;
         int is_parent = 1;
 
+        /* Calculate per-TC rate */
+        double rate_per_tc_mbps = g_config.rate_mbps;
+        if (g_config.rate_mbps > 0 && !g_config.rate_per_tc) {
+            /* If not --rate-per-tc, divide total rate across TCs */
+            rate_per_tc_mbps = g_config.rate_mbps / num_tc;
+        }
+
         if (!g_config.quiet) {
             printf("\n══════════════════════════════════════════════════════════════════════════════\n");
             printf(" Multi-TC Mode: %d Traffic Classes (PCP 0-%d)\n", num_tc, num_tc - 1);
-            printf(" VLAN: %d | Rate: %.0f Mbps/TC | Duration: %d sec\n",
+            printf(" VLAN: %d | Rate: %.0f Mbps%s | Duration: %d sec\n",
                    g_config.multi_tc_vlan,
-                   g_config.rate_mbps > 0 ? g_config.rate_mbps : 0,
+                   rate_per_tc_mbps > 0 ? rate_per_tc_mbps : 0,
+                   g_config.rate_per_tc ? "/TC" : "/TC (total split)",
                    g_config.duration);
+            printf(" Clock: CLOCK_MONOTONIC_RAW (for timestamp)\n");
             printf("══════════════════════════════════════════════════════════════════════════════\n");
             fflush(stdout);
         }
@@ -1788,6 +1808,9 @@ int main(int argc, char *argv[]) {
                 /* Set SKB priority */
                 g_config.skb_priority = tc;
                 g_config.use_skb_priority = 1;
+
+                /* Apply calculated rate */
+                g_config.rate_mbps = rate_per_tc_mbps;
 
                 /* Clear multi-TC to prevent recursion */
                 g_config.multi_tc_count = 0;

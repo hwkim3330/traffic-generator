@@ -11,22 +11,25 @@
 
 ## 주요 기능
 
-### tsngen (TX)
+### tsngen (TX) v1.5.0
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
 - **Multi-TC 모드** - 8개 TC 동시 전송
 - **VLAN PCP/DEI** 지원
 - **tc/qdisc 연동** (SO_PRIORITY, PACKET_FANOUT)
 - **토큰 버킷** 정밀 레이트 제한
+- **--rate-per-tc** - Multi-TC 레이트 정책 명확화
 - **패킷간 딜레이** (ns/us/ms 정밀도)
+- **CLOCK_MONOTONIC_RAW** 타임스탬프
 
-### tsnrecv (RX)
+### tsnrecv (RX) v1.1.0
 - **recvmmsg** 고속 배치 수신
+- **SO_RXQ_OVFL** - 커널 드롭 감지
 - **PCP별 실시간 통계** - CBS/TAS 검증
+- **Per-PCP 시퀀스 추적** - Multi-TC 손실 분석
 - **VLAN 필터링** - 특정 VLAN/PCP만 캡처
-- **시퀀스 추적** - 패킷 손실/순서 오류 감지
-- **지연 측정** - tsngen 타임스탬프 기반
-- **Inter-arrival time** - 패킷 간격 분석
-- **CSV 출력** - 후처리 분석용
+- **지연 측정** - CLOCK_MONOTONIC_RAW 기반
+- **CPU Affinity** - RX 스레드 코어 고정
+- **표준화 CSV 스키마** - 자동화/후처리용
 
 ## 설치
 
@@ -38,15 +41,15 @@ sudo make install  # 선택
 ## 빠른 시작
 
 ```bash
-# TX: 8개 TC 동시 전송
-sudo ./tsngen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 --multi-tc 0-7:100 -r 100
+# TX: 8개 TC 동시 전송 (100 Mbps/TC)
+sudo ./tsngen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 --multi-tc 0-7:100 -r 100 --rate-per-tc
 
-# RX: PCP별 통계 수집
-sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --duration 60
+# RX: PCP별 통계 수집 (CPU 2 고정)
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --affinity=2 --duration 60
 
 # 손실률/지연 측정
 sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 --seq --timestamp &
-sudo ./tsnrecv eth1 --vlan 100 --seq --latency
+sudo ./tsnrecv eth1 --vlan 100 --seq --latency --csv results.csv
 ```
 
 ## tsngen 옵션
@@ -67,6 +70,7 @@ Layer 2/3/4:
 
 Traffic Control:
   -r, --rate MBPS          속도 제한
+  --rate-per-tc            Multi-TC에서 레이트는 TC당 (기본: 총합 분배)
   --duration SEC           지속 시간
   --multi-tc TC[:VLAN]     멀티 TC 모드 (예: 0-7:100)
   -d, --delay DELAY        패킷간 딜레이 (100ns, 10us, 1ms)
@@ -78,7 +82,7 @@ Performance:
 
 Packet:
   --seq                    시퀀스 번호 삽입
-  --timestamp              타임스탬프 삽입
+  --timestamp              타임스탬프 삽입 (CLOCK_MONOTONIC_RAW)
   -l, --length SIZE|MIN-MAX    패킷 크기
 
 Output:
@@ -100,13 +104,47 @@ Capture:
   --batch NUM              배치 크기 (기본: 256)
 
 Analysis:
-  --seq                    시퀀스 추적 (손실/순서 오류)
+  --seq                    시퀀스 추적 (per-PCP for VLAN traffic)
   --latency                지연 측정 (tsngen --timestamp 필요)
   --pcp-stats              PCP별 통계 표시
 
+Performance:
+  --affinity[=CPU]         RX 스레드 CPU 고정 (기본: 0)
+
 Output:
-  --csv FILE               CSV 파일 출력
+  --csv FILE               CSV 파일 출력 (표준화 스키마)
   -q, --quiet              조용히 실행
+```
+
+## 타임스탬프 정책
+
+- **Clock**: `CLOCK_MONOTONIC_RAW` (NTP 영향 없음)
+- **TX**: tsngen `--timestamp`로 payload에 ns 삽입
+- **RX**: tsnrecv `--latency`로 수신 시각과 비교
+- **제한**: TX/RX가 같은 머신에서 동작해야 정확한 지연 측정
+- **Cross-machine**: PTP 동기화된 HW 타임스탬프 사용 필요
+
+## 드롭 감지
+
+tsnrecv는 `SO_RXQ_OVFL`을 사용하여 커널/소켓 드롭을 감지:
+
+```
+Summary:
+  Kernel Drops:   0 (SO_RXQ_OVFL)
+```
+
+- **Drops > 0**: 수신 병목 발생 (버퍼 부족, CPU 부족)
+- **해결**: `--affinity`, 소켓 버퍼 증가, 배치 크기 조정
+
+## CSV 스키마
+
+표준화된 CSV 컬럼 (자동화/후처리 호환):
+
+```
+time_s,total_pkts,total_pps,total_mbps,drops,
+pcp0_pkts,pcp1_pkts,pcp2_pkts,pcp3_pkts,pcp4_pkts,pcp5_pkts,pcp6_pkts,pcp7_pkts,
+latency_min_ns,latency_avg_ns,latency_max_ns,
+iat_min_ns,iat_avg_ns,iat_max_ns
 ```
 
 ## 사용 예제
@@ -124,21 +162,32 @@ sudo ./tsnrecv eth1 --duration 60
 ### Multi-TC TSN 테스트
 
 ```bash
-# TX: 8개 TC 동시 전송
-sudo ./tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 -r 100 --duration 60
+# TX: 8개 TC 동시 전송 (각 TC 100 Mbps)
+sudo ./tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 -r 100 --rate-per-tc --seq --timestamp
 
-# RX: PCP별 통계
-sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --duration 60
+# RX: PCP별 통계 + per-PCP 시퀀스 추적
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --seq --affinity=2 --csv results.csv
 ```
 
 ### CBS (Credit-Based Shaper) 검증
 
 ```bash
-# TX: TC2, TC6 트래픽
-sudo ./tsngen eth0 -B IP -b MAC --multi-tc 2,6:100 -r 500
+# TX: TC2=1.5Mbps, TC6=3.5Mbps 목표
+sudo ./tsngen eth0 -B IP -b MAC --multi-tc 2,6:100 -r 1500 --rate-per-tc &  # TC2
+sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 -r 3500 &  # TC6
 
-# RX: 실제 수신량 확인
-sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --csv cbs_results.csv
+# RX: 실제 수신량 확인 (CBS가 목표대로 shaping 했는지)
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --csv cbs_results.csv --duration 60
+```
+
+### TAS (Time-Aware Shaper) 검증
+
+```bash
+# TX: 모든 PCP 동시 전송 (gate pattern 확인용)
+sudo ./tsngen eth0 -B IP -b MAC --multi-tc 0-7:100 -r 50 --rate-per-tc --seq --timestamp
+
+# RX: inter-arrival time으로 gate open 구간 확인
+sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --latency --csv tas_results.csv
 ```
 
 ### 손실률/지연 측정
@@ -147,52 +196,52 @@ sudo ./tsnrecv eth1 --vlan 100 --pcp-stats --csv cbs_results.csv
 # TX: 시퀀스 + 타임스탬프
 sudo ./tsngen eth0 -B IP -b MAC -Q 6:100 --seq --timestamp -r 500
 
-# RX: 분석
+# RX: per-PCP 시퀀스 분석 + 지연 측정
 sudo ./tsnrecv eth1 --vlan 100 --pcp 6 --seq --latency
 ```
 
 ## 출력 예시
 
-### tsngen
+### tsngen (Multi-TC)
 
 ```
 ══════════════════════════════════════════════════════════════════════════════
  Multi-TC Mode: 8 Traffic Classes (PCP 0-7)
  VLAN: 100 | Rate: 100 Mbps/TC | Duration: 10 sec
+ Clock: CLOCK_MONOTONIC_RAW (for timestamp)
 ══════════════════════════════════════════════════════════════════════════════
 
 All 8 TCs completed.
 ```
 
-### tsnrecv (PCP 통계)
+### tsnrecv (PCP 통계 + 드롭)
 
 ```
-════════════════════════════════════════════════════════════════════════════════
- tsnrecv v1.0.0 - TSN Traffic Receiver
- Interface: eth1 | Batch: 256 | VLAN: 100
-════════════════════════════════════════════════════════════════════════════════
-    Time │      Packets │        PPS │         Mbps │ PCP0  PCP1  PCP2  PCP3  PCP4  PCP5  PCP6  PCP7
-─────────┼──────────────┼────────────┼──────────────┼─────────────────────────────────────────────────
-    1.0s │       672000 │     672000 │       7916 │ 84000 84000 84000 84000 84000 84000 84000 84000
-    2.0s │      1344000 │     672000 │       7916 │ 84000 84000 84000 84000 84000 84000 84000 84000
-─────────┴──────────────┴────────────┴──────────────┴─────────────────────────────────────────────────
+═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+ tsnrecv v1.1.0 - TSN Traffic Receiver
+ Interface: eth1 | Batch: 256 | VLAN: 100 | CPU: 2
+ Clock: CLOCK_MONOTONIC_RAW (for latency measurement)
+═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+    Time │      Packets │        PPS │       Mbps │  Drops │   PCP0    PCP1    PCP2    PCP3    PCP4    PCP5    PCP6    PCP7
+─────────┼──────────────┼────────────┼────────────┼────────┼───────────────────────────────────────────────────────────────────
+    1.0s │       672000 │     672000 │     7916.0 │      0 │   84000   84000   84000   84000   84000   84000   84000   84000
+─────────┴──────────────┴────────────┴────────────┴────────┴───────────────────────────────────────────────────────────────────
 
 Summary:
-  Duration:       2.00 seconds
-  Total Packets:  1344000
-  Avg Throughput: 7.916 Gbps
+  Duration:       1.00 seconds
+  Total Packets:  672000
+  Kernel Drops:   0 (SO_RXQ_OVFL)
 
   PCP Distribution:
-    PCP 0: 168000 pkts (12.5%), 988.2 Mbps avg
-    PCP 1: 168000 pkts (12.5%), 988.2 Mbps avg
+    PCP 0: 84000 pkts (12.5%), 988.2 Mbps avg
+    PCP 6: 84000 pkts (12.5%), 988.2 Mbps avg [seq_err:0 dup:0]
     ...
-    PCP 7: 168000 pkts (12.5%), 988.2 Mbps avg
 
-  Inter-arrival Time (us):
-    Min: 0.8
-    Avg: 1.5
-    Max: 125.3
-════════════════════════════════════════════════════════════════════════════════
+  Latency (us) [CLOCK_MONOTONIC_RAW]:
+    Min: 12.3
+    Avg: 45.6
+    Max: 234.5
+═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 ```
 
 ## TSN 실험 워크플로우
@@ -203,9 +252,9 @@ Summary:
 │    (TX)     │     │  CBS/TAS    │     │    (RX)     │
 └─────────────┘     └─────────────┘     └─────────────┘
       │                                        │
-      │  --multi-tc 0-7:100                   │  --pcp-stats
-      │  --seq --timestamp                    │  --seq --latency
-      │  -r 100 (Mbps/TC)                     │  --csv results.csv
+      │  --multi-tc 0-7:100                   │  --pcp-stats --seq
+      │  --seq --timestamp                    │  --latency --affinity
+      │  -r 100 --rate-per-tc                 │  --csv results.csv
       │                                        │
       └────────────────────────────────────────┘
               실험 결과 정량화 (CSV)
@@ -214,23 +263,37 @@ Summary:
 ## 성능 튜닝
 
 ```bash
-# 소켓 버퍼
+# 소켓 버퍼 (드롭 방지)
 sudo sysctl -w net.core.wmem_max=67108864
 sudo sysctl -w net.core.rmem_max=67108864
 
 # NIC 링버퍼
 sudo ethtool -G eth0 tx 4096 rx 4096
+
+# CPU 고정 (RX 병목 방지)
+sudo ./tsnrecv eth0 --affinity=2 ...
+
+# 배치 크기 조정
+sudo ./tsnrecv eth0 --batch 512 ...
 ```
+
+## 한계
+
+- **64B 패킷 고PPS**: RX도 튜닝 필요 (affinity, batch, sysctl)
+- **Cross-machine 지연**: 동일 머신에서만 정확 (PTP 미사용)
+- **Multi-TC fork**: 각 TC가 별도 프로세스로 동작
 
 ## 버전 히스토리
 
 ### tsngen
+- v1.5.0: CLOCK_MONOTONIC_RAW, --rate-per-tc 옵션
 - v1.4.0: PACKET_FANOUT, CPU Affinity, RX 통계
 - v1.3.0: Multi-TC 모드
 - v1.2.x: tc 연동, VLAN DEI, 딜레이
 - v1.0.0: 초기 버전
 
 ### tsnrecv
+- v1.1.0: SO_RXQ_OVFL 드롭 감지, CLOCK_MONOTONIC_RAW, per-PCP 시퀀스, CPU affinity, CSV 스키마 표준화
 - v1.0.0: 초기 버전 (recvmmsg, PCP 통계, 지연 분석)
 
 ## 라이선스
