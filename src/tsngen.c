@@ -85,14 +85,16 @@ static inline uint32_t tsn_seq_start(uint8_t tc, uint8_t worker_id) {
 
 static inline int tsn_is_new_format(const void *payload, size_t len) {
     if (len < sizeof(uint32_t)) return 0;
-    return (*(const uint32_t *)payload == htonl(TSN_PAYLOAD_MAGIC));
+    uint32_t m;
+    memcpy(&m, payload, sizeof(m));
+    return (m == htonl(TSN_PAYLOAD_MAGIC));
 }
 
 /*============================================================================
  * Constants
  *============================================================================*/
 
-#define VERSION "1.8.2"
+#define VERSION "1.8.3"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_PACKET_SIZE 1472
@@ -252,7 +254,7 @@ typedef struct {
     atomic_uint_fast64_t bytes_recv;
     atomic_uint_fast64_t packets_dropped;
     atomic_uint_fast64_t seq_errors;      /* Out of order / missing */
-    uint32_t last_seq;
+    uint32_t last_seq[256];               /* Per flow_id tracking */
 } rx_stats_t;
 
 /* Worker statistics */
@@ -1068,60 +1070,54 @@ static void *rx_thread(void *arg) {
 
             /* Check sequence number if present in UDP payload */
             if (cfg->add_seq_num && len >= 46) {
-                int offset = 14;  /* Ethernet header */
+                /* Parse ethertype, skip VLAN tags */
+                int off = 12;
+                uint16_t ethertype = (buf[off] << 8) | buf[off + 1];
+                off = 14;
 
-                /* Skip VLAN tags (single or QinQ) */
-                while (offset + 4 <= len) {
-                    uint16_t ethertype = (buf[offset - 2] << 8) | buf[offset - 1];
-                    if (offset == 14) {
-                        ethertype = (buf[12] << 8) | buf[13];
-                    }
-                    if (ethertype == 0x8100 || ethertype == 0x88a8) {
-                        offset += 4;
-                    } else {
-                        break;
-                    }
+                while ((ethertype == 0x8100 || ethertype == 0x88a8) && off + 4 <= len) {
+                    ethertype = (buf[off + 2] << 8) | buf[off + 3];
+                    off += 4;
                 }
 
                 /* Check for IPv4 */
-                if (offset + 20 <= len && (buf[offset] >> 4) == 4) {
-                    int ihl = (buf[offset] & 0x0F) * 4;  /* IP header length */
-                    uint8_t proto = buf[offset + 9];
+                if (ethertype == 0x0800 && off + 20 <= len && (buf[off] >> 4) == 4) {
+                    int ihl = (buf[off] & 0x0F) * 4;
+                    uint8_t proto = buf[off + 9];
 
-                    if (proto == 17 && offset + ihl + 8 <= len) {  /* UDP */
-                        int payload_start = offset + ihl + 8;
+                    if (proto == 17 && off + ihl + 8 <= len) {  /* UDP */
+                        int payload_start = off + ihl + 8;
                         int payload_len = len - payload_start;
 
                         uint32_t seq = 0;
+                        uint8_t flow_id = 0;
                         int found_seq = 0;
 
                         /* Try new TSN header format first */
                         if (payload_len >= TSN_PAYLOAD_HDR_SIZE &&
                             tsn_is_new_format(buf + payload_start, payload_len)) {
                             const tsn_payload_hdr_t *hdr = (const tsn_payload_hdr_t *)(buf + payload_start);
+                            flow_id = hdr->flow_id;
                             if (TSN_HDR_HAS_SEQ(hdr)) {
                                 seq = ntohl(hdr->seq_num);
                                 found_seq = 1;
                             }
                         }
-                        /* Fall back to legacy format */
-                        else if (payload_len >= 4 && !cfg->legacy_payload) {
-                            /* If using new format but received legacy, skip */
-                        }
+                        /* Fall back to legacy format (flow_id=0) */
                         else if (payload_len >= 4) {
                             memcpy(&seq, buf + payload_start, 4);
                             seq = ntohl(seq);
-                            /* Sanity check: magic would be 0x54534E31 */
                             if (seq != TSN_PAYLOAD_MAGIC) {
                                 found_seq = 1;
                             }
                         }
 
                         if (found_seq) {
-                            if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
+                            uint32_t *last = &g_rx_stats.last_seq[flow_id];
+                            if (*last != 0 && seq != *last + 1) {
                                 atomic_fetch_add(&g_rx_stats.seq_errors, 1);
                             }
-                            g_rx_stats.last_seq = seq;
+                            *last = seq;
                         }
                     }
                 }

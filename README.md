@@ -11,7 +11,7 @@
 
 ## 주요 기능
 
-### tsngen (TX) v1.8.2
+### tsngen (TX) v1.8.3
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
 - **Multi-TC 모드** - 8개 TC 동시 전송
 - **VLAN PCP/DEI** 지원
@@ -20,7 +20,7 @@
 - **패킷간 딜레이** (ns/us/ms 정밀도)
 - **CLOCK_MONOTONIC_RAW** 타임스탬프
 
-### tsnrecv (RX) v1.3.0
+### tsnrecv (RX) v1.3.1
 - **recvmmsg** 고속 배치 수신
 - **SO_RXQ_OVFL** - 커널 드롭 감지
 - **PCP별 실시간 통계** - CBS/TAS 검증
@@ -347,6 +347,7 @@ sudo ./tsnrecv eth0 --batch 512 ...
 ## 버전 히스토리
 
 ### tsngen
+- v1.8.3: flow_id별 seq 추적, VLAN/QinQ 파서 수정, unaligned read 제거
 - v1.8.2: SO_PRIORITY/PACKET_FANOUT 제거 (의존성 간소화)
 - v1.8.1: token_bucket g_running 체크, --pps 옵션 동작 수정
 - v1.8.0: 버그 수정 - L4 체크섬 payload 반영, seq_num 이중 증가 수정, rand() thread-safe 변경
@@ -359,6 +360,7 @@ sudo ./tsnrecv eth0 --batch 512 ...
 - v1.0.0: 초기 버전
 
 ### tsnrecv
+- v1.3.1: QinQ 지원, IHL 파싱, unaligned read 제거
 - v1.3.0: TSN payload 헤더 v1 파싱, flow_id 지원, 레거시 호환
 - v1.2.0: Latency 경고 (drops>0), CSV -1 처리, 버그 수정
 - v1.1.0: SO_RXQ_OVFL 드롭 감지, CLOCK_MONOTONIC_RAW, per-PCP 시퀀스, CPU affinity, CSV 스키마 표준화

@@ -69,7 +69,9 @@ typedef struct {
 
 static inline int tsn_is_new_format(const void *payload, size_t len) {
     if (len < sizeof(uint32_t)) return 0;
-    return (*(const uint32_t *)payload == htonl(TSN_PAYLOAD_MAGIC));
+    uint32_t m;
+    memcpy(&m, payload, sizeof(m));
+    return (m == htonl(TSN_PAYLOAD_MAGIC));
 }
 
 /* SO_RXQ_OVFL for drop detection (if not defined) */
@@ -81,7 +83,7 @@ static inline int tsn_is_new_format(const void *payload, size_t len) {
  * Constants
  *============================================================================*/
 
-#define VERSION "1.3.0"
+#define VERSION "1.3.1"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_BATCH_SIZE 256
@@ -259,19 +261,17 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     uint16_t ethertype = (buf[offset] << 8) | buf[offset + 1];
     offset += 2;
 
-    /* Check for VLAN tag (0x8100) */
-    if (ethertype == 0x8100) {
-        if (len < 18) return -1;
-
-        pkt->has_vlan = 1;
-        uint16_t tci = (buf[offset] << 8) | buf[offset + 1];
-        pkt->pcp = (tci >> 13) & 0x7;
-        pkt->dei = (tci >> 12) & 0x1;
-        pkt->vlan_id = tci & 0xfff;
-        offset += 2;
-
-        ethertype = (buf[offset] << 8) | buf[offset + 1];
-        offset += 2;
+    /* Check for VLAN tags (single or QinQ) */
+    while ((ethertype == 0x8100 || ethertype == 0x88a8) && offset + 4 <= len) {
+        if (!pkt->has_vlan) {
+            pkt->has_vlan = 1;
+            uint16_t tci = (buf[offset] << 8) | buf[offset + 1];
+            pkt->pcp = (tci >> 13) & 0x7;
+            pkt->dei = (tci >> 12) & 0x1;
+            pkt->vlan_id = tci & 0xfff;
+        }
+        ethertype = (buf[offset + 2] << 8) | buf[offset + 3];
+        offset += 4;
     }
 
     pkt->ethertype = ethertype;
@@ -279,12 +279,12 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
 
     /* Try to extract TSN header from UDP payload */
     if (ethertype == 0x0800 && len >= offset + 20 + 8) {
-        /* IP header (assuming no options) */
         int ip_offset = offset;
+        int ihl = (buf[ip_offset] & 0x0F) * 4;
         uint8_t ip_proto = buf[ip_offset + 9];
 
-        if (ip_proto == 17) {  /* UDP */
-            int udp_offset = ip_offset + 20;
+        if (ip_proto == 17 && len >= ip_offset + ihl + 8) {  /* UDP */
+            int udp_offset = ip_offset + ihl;
             int payload_start = udp_offset + 8;
             int payload_len = len - payload_start;
 
