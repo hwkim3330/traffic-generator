@@ -933,7 +933,8 @@ static void *worker_thread(void *arg) {
                     local_packets++;
                     local_bytes += pkt_sizes[i];
                 }
-                /* Count unsent packets as errors */
+                /* Count unsent packets as errors (partial send = buffer/resource limits)
+                 * Note: errors counter includes both OS failures and partial sends */
                 if (sent < batch) {
                     local_errors += (batch - sent);
                 }

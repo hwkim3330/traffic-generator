@@ -161,12 +161,12 @@ typedef struct {
     /* Kernel/socket drops (from SO_RXQ_OVFL) */
     atomic_uint_fast64_t kernel_drops;
 
-    /* Sequence tracking */
+    /* Sequence tracking (atomic for stats_thread safety) */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
-    uint32_t first_seq; /* First seen sequence */
-    uint32_t last_seq;  /* Last seen sequence */
-    int seq_started;    /* Flag: have we seen first seq? */
+    atomic_uint_fast32_t first_seq;
+    atomic_uint_fast32_t last_seq;
+    atomic_int seq_started;
 
     /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
     atomic_uint_fast64_t latency_sum;
@@ -470,10 +470,15 @@ static void *rx_thread(void *arg) {
     uint64_t local_bytes = 0;
     uint64_t last_drop_count = 0;
 
-    /* PCAP batch buffer */
+    /* PCAP batch buffer
+     * NOTE: entries[].data points to buffers[] which remain valid until next recvmmsg cycle */
     pcap_entry_t *pcap_entries = NULL;
     if (g_pcap_fp) {
         pcap_entries = malloc(batch * sizeof(pcap_entry_t));
+        if (!pcap_entries) {
+            fprintf(stderr, "Warning: PCAP buffer alloc failed, disabling PCAP\n");
+            /* pcap_entries stays NULL, pcap writes will be skipped */
+        }
     }
 
     while (g_running) {
@@ -551,19 +556,20 @@ static void *rx_thread(void *arg) {
                 } else {
                     atomic_fetch_add(&g_stats.non_vlan_packets, 1);
 
-                    /* Sequence tracking */
+                    /* Sequence tracking (atomic for stats_thread safety) */
                     if (cfg->check_seq && pkt.has_seq) {
-                        if (!g_stats.seq_started) {
-                            g_stats.first_seq = pkt.seq_num;
-                            g_stats.seq_started = 1;
+                        if (!atomic_load(&g_stats.seq_started)) {
+                            atomic_store(&g_stats.first_seq, pkt.seq_num);
+                            atomic_store(&g_stats.seq_started, 1);
                         } else {
-                            if (pkt.seq_num == g_stats.last_seq) {
+                            uint32_t last = atomic_load(&g_stats.last_seq);
+                            if (pkt.seq_num == last) {
                                 atomic_fetch_add(&g_stats.seq_duplicates, 1);
-                            } else if (pkt.seq_num != g_stats.last_seq + 1) {
+                            } else if (pkt.seq_num != last + 1) {
                                 atomic_fetch_add(&g_stats.seq_errors, 1);
                             }
                         }
-                        g_stats.last_seq = pkt.seq_num;
+                        atomic_store(&g_stats.last_seq, pkt.seq_num);
                     }
                 }
 
@@ -573,16 +579,16 @@ static void *rx_thread(void *arg) {
                     atomic_fetch_add(&g_stats.latency_sum, latency);
                     atomic_fetch_add(&g_stats.latency_count, 1);
 
-                    /* CAS loop for min */
-                    uint64_t cur_min = atomic_load(&g_stats.latency_min);
-                    while (latency < cur_min || cur_min == 0) {
-                        if (atomic_compare_exchange_weak(&g_stats.latency_min, &cur_min, latency))
+                    /* CAS loop for min (cur updated by CAS on failure) */
+                    uint64_t cur = atomic_load(&g_stats.latency_min);
+                    while (cur == 0 || latency < cur) {
+                        if (atomic_compare_exchange_weak(&g_stats.latency_min, &cur, latency))
                             break;
                     }
                     /* CAS loop for max */
-                    uint64_t cur_max = atomic_load(&g_stats.latency_max);
-                    while (latency > cur_max) {
-                        if (atomic_compare_exchange_weak(&g_stats.latency_max, &cur_max, latency))
+                    cur = atomic_load(&g_stats.latency_max);
+                    while (latency > cur) {
+                        if (atomic_compare_exchange_weak(&g_stats.latency_max, &cur, latency))
                             break;
                     }
                 }
@@ -593,16 +599,16 @@ static void *rx_thread(void *arg) {
                     atomic_fetch_add(&g_stats.iat_sum, iat);
                     atomic_fetch_add(&g_stats.iat_count, 1);
 
-                    /* CAS loop for min */
-                    uint64_t cur_min = atomic_load(&g_stats.iat_min);
-                    while (iat < cur_min || cur_min == 0) {
-                        if (atomic_compare_exchange_weak(&g_stats.iat_min, &cur_min, iat))
+                    /* CAS loop for min (cur updated by CAS on failure) */
+                    uint64_t cur = atomic_load(&g_stats.iat_min);
+                    while (cur == 0 || iat < cur) {
+                        if (atomic_compare_exchange_weak(&g_stats.iat_min, &cur, iat))
                             break;
                     }
                     /* CAS loop for max */
-                    uint64_t cur_max = atomic_load(&g_stats.iat_max);
-                    while (iat > cur_max) {
-                        if (atomic_compare_exchange_weak(&g_stats.iat_max, &cur_max, iat))
+                    cur = atomic_load(&g_stats.iat_max);
+                    while (iat > cur) {
+                        if (atomic_compare_exchange_weak(&g_stats.iat_max, &cur, iat))
                             break;
                     }
                 }
@@ -819,10 +825,12 @@ static void *stats_thread(void *arg) {
         }
 
         /* Global sequence analysis (for non-VLAN traffic) */
-        if (cfg->check_seq && g_stats.seq_started) {
+        if (cfg->check_seq && atomic_load(&g_stats.seq_started)) {
             uint64_t seq_errors = atomic_load(&g_stats.seq_errors);
             uint64_t seq_dups = atomic_load(&g_stats.seq_duplicates);
-            uint32_t seq_range = g_stats.last_seq - g_stats.first_seq + 1;
+            uint32_t first = atomic_load(&g_stats.first_seq);
+            uint32_t last = atomic_load(&g_stats.last_seq);
+            uint32_t seq_range = last - first + 1;
             uint64_t received = nonvlan_pkts - seq_dups;
 
             printf("\n  Sequence Analysis (non-VLAN):\n");
@@ -910,6 +918,11 @@ static void print_usage(const char *prog) {
     printf("  - Uses CLOCK_MONOTONIC_RAW for latency measurement\n");
     printf("  - txgen must also use --timestamp for latency to work\n");
     printf("  - Both tools must run on the same machine for accurate latency\n");
+    printf("\n");
+    printf("Protocol Support:\n");
+    printf("  - IPv4/IPv6 UDP packets with seq/timestamp parsing\n");
+    printf("  - IPv6: UDP must follow IPv6 header directly (no extension headers)\n");
+    printf("  - VLAN: 802.1Q (0x8100), QinQ (0x88a8), 802.1ad (0x9100)\n");
     printf("\n");
     printf("Drop Detection:\n");
     printf("  - Uses SO_RXQ_OVFL to detect kernel/socket drops\n");
