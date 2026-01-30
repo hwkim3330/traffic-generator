@@ -604,7 +604,7 @@ static void *stats_thread(void *arg) {
         if (cfg->filter_pcp) printf(" | PCP: %d", cfg->pcp);
         if (cfg->use_affinity) printf(" | CPU: %d", cfg->affinity_cpu >= 0 ? cfg->affinity_cpu : 0);
         printf("\n");
-        printf(" Clock: CLOCK_MONOTONIC_RAW (for latency measurement)\n");
+        printf(" Clock: CLOCK_MONOTONIC_RAW (same-machine latency only)\n");
         printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
 
         if (cfg->show_pcp_stats) {
@@ -776,9 +776,9 @@ static void *stats_thread(void *arg) {
         if (cfg->measure_latency && lat_cnt > 0) {
             uint64_t lat_sum = atomic_load(&g_stats.latency_sum);
             double avg_lat = (double)lat_sum / lat_cnt / 1000.0;
-            printf("\n  Latency (us) [CLOCK_MONOTONIC_RAW]:\n");
+            printf("\n  Latency (us) [same-machine only]:\n");
             if (kernel_drops > 0) {
-                printf("    ⚠ WARNING: drops > 0, latency may be inflated by RX backlog\n");
+                printf("    ⚠ drops > 0, latency may be inflated\n");
             }
             printf("    Min: %.1f\n", atomic_load(&g_stats.latency_min) / 1000.0);
             printf("    Avg: %.1f\n", avg_lat);

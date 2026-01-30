@@ -304,7 +304,7 @@ static pthread_t g_workers[MAX_WORKERS];
 static pthread_t g_stats_thread;
 static pthread_t g_rx_thread;
 static struct timespec g_start_time;
-static token_bucket_t g_bucket;
+static token_bucket_t g_buckets[MAX_WORKERS];  /* Per-worker buckets */
 static FILE *g_stats_fp = NULL;
 
 /* Thread-local PRNG seed for thread-safe random number generation */
@@ -1543,7 +1543,7 @@ static int replay_pcap(config_t *cfg) {
 
         /* Rate limiting */
         if (cfg->rate_mbps > 0) {
-            token_bucket_consume(&g_bucket, pkthdr.incl_len);
+            token_bucket_consume(&g_buckets[0], pkthdr.incl_len);
         }
 
         /* Duration check */
@@ -1995,23 +1995,31 @@ int main(int argc, char *argv[]) {
     if (strlen(g_config.replay_file) > 0) {
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
-        token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.rate_pps,
+        token_bucket_init(&g_buckets[0], g_config.rate_mbps, g_config.rate_pps,
                           g_config.batch_size, g_config.packet_size);
         return replay_pcap(&g_config);
     }
 
-    token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.rate_pps,
-                      g_config.batch_size, g_config.packet_size);
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
 
     /* Start workers */
     worker_ctx_t *contexts = calloc(g_config.num_workers, sizeof(worker_ctx_t));
 
+    /* Per-worker rate = total rate / num_workers */
+    double worker_rate_mbps = g_config.rate_mbps > 0 ?
+                              g_config.rate_mbps / g_config.num_workers : 0;
+    double worker_rate_pps = g_config.rate_pps > 0 ?
+                             g_config.rate_pps / g_config.num_workers : 0;
+
     for (int i = 0; i < g_config.num_workers; i++) {
+        /* Init per-worker bucket (no lock contention) */
+        token_bucket_init(&g_buckets[i], worker_rate_mbps, worker_rate_pps,
+                          g_config.batch_size, g_config.packet_size);
+
         contexts[i].id = i;
         contexts[i].cfg = &g_config;
         contexts[i].stats = &g_stats[i];
-        contexts[i].bucket = &g_bucket;
+        contexts[i].bucket = &g_buckets[i];
         /* Simple sequence: TC offset + worker offset */
         contexts[i].seq_num = g_config.tc_seq_offset + (i * 10000000);
 
