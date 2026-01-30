@@ -884,7 +884,7 @@ static void *worker_thread(void *arg) {
     uint64_t local_bytes = 0;
     uint64_t local_errors = 0;
     struct timespec last_update;
-    clock_gettime(CLOCK_MONOTONIC, &last_update);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &last_update);
 
     while (g_running) {
         /* Build batch of packets */
@@ -950,7 +950,7 @@ static void *worker_thread(void *arg) {
 
         /* Periodic stats update */
         struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        clock_gettime(CLOCK_MONOTONIC_RAW, &now);
         double ms = (now.tv_sec - last_update.tv_sec) * 1000.0 +
                    (now.tv_nsec - last_update.tv_nsec) / 1e6;
 
@@ -1035,7 +1035,7 @@ static void *rx_thread(void *arg) {
     uint64_t local_packets = 0;
     uint64_t local_bytes = 0;
     struct timespec last_update;
-    clock_gettime(CLOCK_MONOTONIC, &last_update);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &last_update);
 
     while (g_running) {
         ssize_t len = recv(sock, buf, sizeof(buf), 0);
@@ -1087,7 +1087,7 @@ static void *rx_thread(void *arg) {
 
             /* Periodic stats update */
             struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
+            clock_gettime(CLOCK_MONOTONIC_RAW, &now);
             double ms = (now.tv_sec - last_update.tv_sec) * 1000.0 +
                        (now.tv_nsec - last_update.tv_nsec) / 1e6;
             if (ms >= 100) {
@@ -2013,8 +2013,12 @@ int main(int argc, char *argv[]) {
         /* Replay mode: rate-based burst (100ms worth of data) */
         token_bucket_init(&g_buckets[0], g_config.rate_mbps, g_config.rate_pps,
                           g_config.batch_size, g_config.packet_size);
-        if (g_config.rate_mbps > 0) {
-            /* 100ms burst at configured rate */
+        if (g_config.rate_pps > 0) {
+            /* PPS mode: 100ms burst based on pps * packet_size */
+            double bytes_per_sec = g_config.rate_pps * g_config.packet_size;
+            g_buckets[0].max_tokens = bytes_per_sec * 0.1;
+        } else if (g_config.rate_mbps > 0) {
+            /* Mbps mode: 100ms burst at configured rate */
             g_buckets[0].max_tokens = g_config.rate_mbps * 1e6 / 8.0 * 0.1;
         } else {
             /* No rate limit - large burst */
