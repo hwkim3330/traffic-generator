@@ -454,9 +454,20 @@ static void *rx_thread(void *arg) {
     size_t cmsg_size = CMSG_SPACE(sizeof(uint32_t));
     uint8_t **cmsg_bufs = malloc(batch * sizeof(uint8_t *));
 
+    if (!buffers || !msgs || !iovecs || !cmsg_bufs) {
+        fprintf(stderr, "RX thread: malloc failed\n");
+        close(sock);
+        return NULL;
+    }
+
     for (int i = 0; i < batch; i++) {
         buffers[i] = aligned_alloc(64, MAX_PACKET_SIZE_ALIGNED);
         cmsg_bufs[i] = malloc(cmsg_size);
+        if (!buffers[i] || !cmsg_bufs[i]) {
+            fprintf(stderr, "RX thread: buffer alloc failed\n");
+            close(sock);
+            return NULL;
+        }
         iovecs[i].iov_base = buffers[i];
         iovecs[i].iov_len = MAX_PACKET_SIZE;
         msgs[i].msg_hdr.msg_iov = &iovecs[i];

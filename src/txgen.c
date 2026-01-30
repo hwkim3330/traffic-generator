@@ -317,7 +317,7 @@ static inline int tls_rand(void) {
 /* Initialize thread-local seed (call at start of each worker) */
 static inline void tls_rand_init(int worker_id) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     tls_rand_seed = (unsigned int)(ts.tv_nsec ^ (ts.tv_sec << 16) ^ (worker_id * 1000003));
 }
 
@@ -872,8 +872,17 @@ static void *worker_thread(void *arg) {
     uint8_t **packets = malloc(batch * sizeof(uint8_t *));
     int *pkt_sizes = malloc(batch * sizeof(int));
 
+    if (!packets || !pkt_sizes) {
+        fprintf(stderr, "Worker %d: malloc failed\n", ctx->id);
+        return NULL;
+    }
+
     for (int i = 0; i < batch; i++) {
         packets[i] = aligned_alloc(64, MAX_PACKET_SIZE_ALIGNED);
+        if (!packets[i]) {
+            fprintf(stderr, "Worker %d: aligned_alloc failed\n", ctx->id);
+            return NULL;
+        }
         memset(packets[i], 0, MAX_PACKET_SIZE);
     }
 
@@ -1043,47 +1052,9 @@ static void *rx_thread(void *arg) {
             local_packets++;
             local_bytes += len;
 
-            /* Check sequence number if present in UDP payload */
-            if (cfg->add_seq_num && len >= 14) {
-                /* Parse ethertype, skip VLAN/QinQ tags */
-                int off = 12;
-                uint16_t ethertype = (buf[off] << 8) | buf[off + 1];
-                off = 14;
-
-                /* Skip VLAN tags (802.1Q=0x8100, QinQ=0x88a8, 802.1ad=0x9100) */
-                while ((ethertype == 0x8100 || ethertype == 0x88a8 || ethertype == 0x9100)
-                       && off + 4 <= len) {
-                    ethertype = (buf[off + 2] << 8) | buf[off + 3];
-                    off += 4;
-                }
-
-                /* Check for IPv4 UDP */
-                if (ethertype == 0x0800 && off + 20 <= len) {
-                    uint8_t ver = buf[off] >> 4;
-                    if (ver == 4) {
-                        int ihl = (buf[off] & 0x0F) * 4;
-                        if (ihl >= 20 && off + ihl <= len) {
-                            uint8_t proto = buf[off + 9];
-                            if (proto == 17 && off + ihl + 8 <= len) {  /* UDP */
-                                int payload_start = off + ihl + 8;
-                                int payload_len = len - payload_start;
-
-                                /* Simple seq format: first 4 bytes = seq number */
-                                if (payload_len >= 4) {
-                                    uint32_t seq;
-                                    memcpy(&seq, buf + payload_start, 4);
-                                    seq = ntohl(seq);
-
-                                    if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
-                                        atomic_fetch_add(&g_rx_stats.seq_errors, 1);
-                                    }
-                                    g_rx_stats.last_seq = seq;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            /* Note: seq tracking disabled in txgen RX mode
+             * Multi-worker sends interleaved sequences, making seq check meaningless.
+             * Use rxcap for accurate sequence/loss analysis. */
 
             /* Periodic stats update */
             struct timespec now;
@@ -1252,7 +1223,6 @@ static void *stats_thread(void *arg) {
         if (cfg->rx_mode) {
             uint64_t rx_packets = atomic_load(&g_rx_stats.packets_recv);
             uint64_t rx_bytes = atomic_load(&g_rx_stats.bytes_recv);
-            uint64_t seq_errors = atomic_load(&g_rx_stats.seq_errors);
             double loss_pct = total_packets > 0 ?
                 100.0 * (1.0 - (double)rx_packets / (double)total_packets) : 0.0;
             if (loss_pct < 0) loss_pct = 0;
@@ -1261,8 +1231,7 @@ static void *stats_thread(void *arg) {
             printf("  RX Data:        %.3f GB\n", rx_bytes / (1024.0 * 1024.0 * 1024.0));
             printf("  RX Avg Rate:    %.0f pps\n", rx_packets / total_time);
             printf("  RX Throughput:  %.3f Gbps\n", (rx_bytes * 8.0) / (total_time * 1e9));
-            printf("  Seq Errors:     %lu\n", seq_errors);
-            printf("  Packet Loss:    %.2f%%\n", loss_pct);
+            printf("  Packet Loss:    %.2f%% (approx)\n", loss_pct);
         }
         printf("════════════════════════════════════════════════════════════════════════════════════════════\n");
     }
