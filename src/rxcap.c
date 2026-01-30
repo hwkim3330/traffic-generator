@@ -921,7 +921,7 @@ static void print_usage(const char *prog) {
     printf("  --affinity[=CPU]         Pin RX thread to CPU core (default: 0)\n");
     printf("\n");
     printf("Output:\n");
-    printf("  --csv FILE               Write CSV output (standardized schema)\n");
+    printf("  --csv FILE               Write CSV output (use '-' for stdout)\n");
     printf("  --pcap FILE              Write pcap file (Wireshark compatible)\n");
     printf("  -q, --quiet              Quiet mode\n");
     printf("  -v, --verbose            Verbose output\n");
@@ -1040,9 +1040,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Open CSV file - standardized schema */
+    /* Open CSV file - standardized schema
+     * Use "-" for stdout (useful for piping to other programs) */
     if (strlen(g_config.csv_file) > 0) {
-        g_csv_fp = fopen(g_config.csv_file, "w");
+        if (strcmp(g_config.csv_file, "-") == 0) {
+            g_csv_fp = stdout;
+            g_config.quiet = 1;  /* Suppress table output when CSV goes to stdout */
+        } else {
+            g_csv_fp = fopen(g_config.csv_file, "w");
+        }
         if (g_csv_fp) {
             fprintf(g_csv_fp, "time_s,total_pkts,total_pps,total_mbps,drops");
             for (int p = 0; p < MAX_PCP; p++) {
@@ -1050,6 +1056,7 @@ int main(int argc, char *argv[]) {
             }
             fprintf(g_csv_fp, ",latency_min_ns,latency_avg_ns,latency_max_ns");
             fprintf(g_csv_fp, ",iat_min_ns,iat_avg_ns,iat_max_ns\n");
+            fflush(g_csv_fp);
         }
     }
 
@@ -1109,7 +1116,7 @@ int main(int argc, char *argv[]) {
     pthread_join(g_stats_thread, NULL);
     pthread_join(g_rx_thread, NULL);
 
-    if (g_csv_fp) fclose(g_csv_fp);
+    if (g_csv_fp && g_csv_fp != stdout) fclose(g_csv_fp);
     if (g_pcap_fp) {
         fclose(g_pcap_fp);
         printf("  Pcap saved: %s\n", g_config.pcap_file);
