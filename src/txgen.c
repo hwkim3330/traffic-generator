@@ -77,14 +77,25 @@ typedef struct {
 
 /*============================================================================
  * Simple Payload Header - 12 bytes
- * seq(4B) + timestamp(8B)
+ * seq(4B) + timestamp(8B), both network order
  *============================================================================*/
 #define SIMPLE_PAYLOAD_SIZE    12
+
+/* 64-bit host to network order */
+static inline uint64_t htonll(uint64_t x) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return ((uint64_t)htonl((uint32_t)(x & 0xffffffffULL)) << 32) |
+            htonl((uint32_t)(x >> 32));
+#else
+    return x;
+#endif
+}
+static inline uint64_t ntohll(uint64_t x) { return htonll(x); }
 
 #pragma pack(push, 1)
 typedef struct {
     uint32_t seq_num;     /* Sequence number (network order) */
-    uint64_t timestamp;   /* Timestamp in nanoseconds (host order) */
+    uint64_t timestamp;   /* Timestamp in nanoseconds (network order) */
 } simple_payload_t;
 #pragma pack(pop)
 
@@ -657,18 +668,14 @@ static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq) {
 
     /*
      * Simple Payload Header: seq(4B) + timestamp(8B) = 12B
+     * Always write full 12 bytes when enabled (both network order)
      */
-    if (cfg->add_seq_num || cfg->add_timestamp) {
-        if (cfg->add_seq_num && len >= 4) {
-            uint32_t net_seq = htonl(seq);
-            memcpy(buf, &net_seq, 4);
-            hdr_size = 4;
-        }
-        if (cfg->add_timestamp && len >= 12) {
-            uint64_t ts = get_time_ns();
-            memcpy(buf + 4, &ts, 8);
-            hdr_size = 12;
-        }
+    if (cfg->add_seq_num && len >= SIMPLE_PAYLOAD_SIZE) {
+        uint32_t net_seq = htonl(seq);
+        uint64_t net_ts = cfg->add_timestamp ? htonll(get_time_ns()) : 0;
+        memcpy(buf, &net_seq, 4);
+        memcpy(buf + 4, &net_ts, 8);
+        hdr_size = SIMPLE_PAYLOAD_SIZE;
         data_start = buf + hdr_size;
     }
 
@@ -1346,11 +1353,8 @@ static void print_usage(const char *prog) {
     printf("  # Random source IP, sequence numbers, stats to file\n");
     printf("  sudo %s eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -A rand --seq --stats-file stats.csv\n", prog);
     printf("\n");
-    printf("  # tc integration: VLAN PCP 6, SKB priority 6\n");
-    printf("  sudo %s eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 6:100 --skb-priority 6\n", prog);
-    printf("\n");
-    printf("  # CBS test: PCP 2 and PCP 6 traffic\n");
-    printf("  sudo %s eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 2:100 --skb-priority 2 -r 1500\n", prog);
+    printf("  # VLAN PCP 6 traffic\n");
+    printf("  sudo %s eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 -Q 6:100 -r 500\n", prog);
     printf("\n");
 }
 
@@ -1801,6 +1805,11 @@ int main(int argc, char *argv[]) {
 
     if (optind < argc) {
         strncpy(g_config.interface, argv[optind], IFNAMSIZ - 1);
+    }
+
+    /* Force seq when timestamp is enabled (always use 12-byte header) */
+    if (g_config.add_timestamp && !g_config.add_seq_num) {
+        g_config.add_seq_num = 1;
     }
 
     /* Validation */

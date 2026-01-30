@@ -69,14 +69,24 @@ typedef struct {
 
 /*============================================================================
  * Simple Payload Header - 12 bytes
- * seq(4B) + timestamp(8B)
+ * seq(4B) + timestamp(8B), both network order
  *============================================================================*/
 #define SIMPLE_PAYLOAD_SIZE    12
+
+/* 64-bit network to host order */
+static inline uint64_t ntohll(uint64_t x) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return ((uint64_t)ntohl((uint32_t)(x & 0xffffffffULL)) << 32) |
+            ntohl((uint32_t)(x >> 32));
+#else
+    return x;
+#endif
+}
 
 #pragma pack(push, 1)
 typedef struct {
     uint32_t seq_num;     /* Sequence number (network order) */
-    uint64_t timestamp;   /* Timestamp in nanoseconds (host order) */
+    uint64_t timestamp;   /* Timestamp in nanoseconds (network order) */
 } simple_payload_t;
 #pragma pack(pop)
 
@@ -333,9 +343,10 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
                 pkt->seq_num = ntohl(pkt->seq_num);
                 pkt->has_seq = 1;
 
-                /* Next 8 bytes: timestamp (host order) */
+                /* Next 8 bytes: timestamp (network order) */
                 memcpy(&pkt->timestamp, buf + payload_start + 4, 8);
-                pkt->has_timestamp = 1;
+                pkt->timestamp = ntohll(pkt->timestamp);
+                pkt->has_timestamp = (pkt->timestamp != 0);
             } else if (payload_len >= 4) {
                 /* At least sequence number */
                 memcpy(&pkt->seq_num, buf + payload_start, 4);
@@ -552,8 +563,14 @@ static void *rx_thread(void *arg) {
             atomic_fetch_add(&g_stats.total_bytes, local_bytes);
             local_packets = 0;
             local_bytes = 0;
-        } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            if (g_running) perror("recvmmsg");
+        } else if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Avoid busy spin - sleep 100us */
+                struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000};
+                nanosleep(&ts, NULL);
+            } else {
+                if (g_running) perror("recvmmsg");
+            }
         }
     }
 
