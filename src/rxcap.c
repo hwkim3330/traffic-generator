@@ -70,10 +70,12 @@ typedef struct {
 #pragma pack(pop)
 
 /*============================================================================
- * Simple Payload Header - 12 bytes
- * seq(4B) + timestamp(8B), both network order
+ * Simple Payload Header - 16 bytes
+ * seq(4B) + timestamp(8B) + pcp(1B) + magic(1B) + reserved(2B)
+ * All multi-byte fields in network order
  *============================================================================*/
-#define SIMPLE_PAYLOAD_SIZE    12
+#define SIMPLE_PAYLOAD_SIZE    16
+#define PAYLOAD_MAGIC          0xAB  /* Magic byte to identify txgen packets */
 
 /* 64-bit network to host order */
 static inline uint64_t ntohll(uint64_t x) {
@@ -89,6 +91,9 @@ static inline uint64_t ntohll(uint64_t x) {
 typedef struct {
     uint32_t seq_num;     /* Sequence number (network order) */
     uint64_t timestamp;   /* Timestamp in nanoseconds (network order) */
+    uint8_t  pcp;         /* PCP value from VLAN tag (embedded for stripped tags) */
+    uint8_t  magic;       /* Magic byte (0xAB) to identify txgen packets */
+    uint16_t reserved;    /* Reserved for future use */
 } simple_payload_t;
 #pragma pack(pop)
 
@@ -309,11 +314,13 @@ typedef struct {
     uint16_t ethertype;
     int payload_offset;
 
-    /* Simple payload fields: seq(4B) + timestamp(8B) */
+    /* Simple payload fields: seq(4B) + timestamp(8B) + pcp(1B) + magic(1B) */
     uint32_t seq_num;
     uint64_t timestamp;
     int has_seq;
     int has_timestamp;
+    uint8_t embedded_pcp;     /* PCP embedded in payload (for stripped VLAN tags) */
+    int has_embedded_pcp;     /* 1 if packet has valid embedded PCP from txgen */
 } parsed_packet_t;
 
 static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
@@ -372,14 +379,32 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     }
 
     if (udp_payload_start >= 0) {
-        /* Simple format (12 bytes): seq(4B) + timestamp(8B) */
+        /* New format (16 bytes): seq(4B) + timestamp(8B) + pcp(1B) + magic(1B) + reserved(2B) */
         if (udp_payload_len >= SIMPLE_PAYLOAD_SIZE) {
-            /* First 4 bytes: sequence number (network order) */
+            uint8_t magic = buf[udp_payload_start + 13];
+
+            /* Verify magic byte to ensure this is a txgen packet */
+            if (magic == PAYLOAD_MAGIC) {
+                /* Sequence number (network order) */
+                memcpy(&pkt->seq_num, buf + udp_payload_start, 4);
+                pkt->seq_num = ntohl(pkt->seq_num);
+                pkt->has_seq = 1;
+
+                /* Timestamp (network order) */
+                memcpy(&pkt->timestamp, buf + udp_payload_start + 4, 8);
+                pkt->timestamp = ntohll(pkt->timestamp);
+                pkt->has_timestamp = (pkt->timestamp != 0);
+
+                /* Embedded PCP - use this when VLAN tags are stripped by NIC */
+                pkt->embedded_pcp = buf[udp_payload_start + 12];
+                pkt->has_embedded_pcp = 1;
+            }
+        } else if (udp_payload_len >= 12) {
+            /* Old format (12 bytes) - backwards compatibility */
             memcpy(&pkt->seq_num, buf + udp_payload_start, 4);
             pkt->seq_num = ntohl(pkt->seq_num);
             pkt->has_seq = 1;
 
-            /* Next 8 bytes: timestamp (network order) */
             memcpy(&pkt->timestamp, buf + udp_payload_start + 4, 8);
             pkt->timestamp = ntohll(pkt->timestamp);
             pkt->has_timestamp = (pkt->timestamp != 0);
@@ -552,14 +577,32 @@ static void *rx_thread(void *arg) {
                     pcap_count++;
                 }
 
-                /* VLAN / PCP stats */
+                /* VLAN / PCP stats
+                 * Priority: 1) VLAN tag PCP, 2) Embedded PCP from txgen payload
+                 * This allows PCP tracking even when NIC strips VLAN tags */
+                uint8_t effective_pcp = 0;
+                int has_pcp = 0;
+
                 if (pkt.has_vlan) {
+                    effective_pcp = pkt.pcp;
+                    has_pcp = 1;
                     atomic_fetch_add(&g_stats.vlan_packets, 1);
-                    atomic_fetch_add(&g_stats.pcp[pkt.pcp].packets, 1);
-                    atomic_fetch_add(&g_stats.pcp[pkt.pcp].bytes, len);
+                } else if (pkt.has_embedded_pcp) {
+                    /* USB NICs strip VLAN tags - use PCP from payload */
+                    effective_pcp = pkt.embedded_pcp;
+                    has_pcp = 1;
+                    atomic_fetch_add(&g_stats.non_vlan_packets, 1);
+                } else {
+                    atomic_fetch_add(&g_stats.non_vlan_packets, 1);
+                }
+
+                /* Per-PCP statistics (works with both VLAN tags and embedded PCP) */
+                if (has_pcp && effective_pcp < MAX_PCP) {
+                    atomic_fetch_add(&g_stats.pcp[effective_pcp].packets, 1);
+                    atomic_fetch_add(&g_stats.pcp[effective_pcp].bytes, len);
 
                     if (cfg->check_seq && pkt.has_seq) {
-                        pcp_stats_t *pcp_stat = &g_stats.pcp[pkt.pcp];
+                        pcp_stats_t *pcp_stat = &g_stats.pcp[effective_pcp];
                         if (pcp_stat->last_seq != 0) {
                             if (pkt.seq_num < pcp_stat->last_seq &&
                                 (pcp_stat->last_seq - pkt.seq_num) > 0x80000000U) {
@@ -574,23 +617,20 @@ static void *rx_thread(void *arg) {
                         }
                         pcp_stat->last_seq = pkt.seq_num;
                     }
-                } else {
-                    atomic_fetch_add(&g_stats.non_vlan_packets, 1);
-
-                    if (cfg->check_seq && pkt.has_seq) {
-                        if (atomic_load(&g_stats.seq_started) == 0) {
-                            atomic_store(&g_stats.first_seq, pkt.seq_num);
-                            atomic_store(&g_stats.last_seq, pkt.seq_num);
-                            atomic_store(&g_stats.seq_started, 1);
-                        } else {
-                            uint32_t last = atomic_load(&g_stats.last_seq);
-                            if (pkt.seq_num == last) {
-                                atomic_fetch_add(&g_stats.seq_duplicates, 1);
-                            } else if (pkt.seq_num != last + 1) {
-                                atomic_fetch_add(&g_stats.seq_errors, 1);
-                            }
-                            atomic_store(&g_stats.last_seq, pkt.seq_num);
+                } else if (!has_pcp && cfg->check_seq && pkt.has_seq) {
+                    /* Global sequence tracking for non-PCP traffic */
+                    if (atomic_load(&g_stats.seq_started) == 0) {
+                        atomic_store(&g_stats.first_seq, pkt.seq_num);
+                        atomic_store(&g_stats.last_seq, pkt.seq_num);
+                        atomic_store(&g_stats.seq_started, 1);
+                    } else {
+                        uint32_t last = atomic_load(&g_stats.last_seq);
+                        if (pkt.seq_num == last) {
+                            atomic_fetch_add(&g_stats.seq_duplicates, 1);
+                        } else if (pkt.seq_num != last + 1) {
+                            atomic_fetch_add(&g_stats.seq_errors, 1);
                         }
+                        atomic_store(&g_stats.last_seq, pkt.seq_num);
                     }
                 }
 

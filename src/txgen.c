@@ -76,7 +76,8 @@ typedef struct {
  * Simple Payload Header - 12 bytes
  * seq(4B) + timestamp(8B), both network order
  *============================================================================*/
-#define SIMPLE_PAYLOAD_SIZE    12
+#define SIMPLE_PAYLOAD_SIZE    16  /* seq(4) + ts(8) + pcp(1) + magic(1) + reserved(2) */
+#define PAYLOAD_MAGIC          0xAB  /* Magic byte to identify txgen packets */
 
 /* 64-bit host to network order */
 static inline uint64_t htonll(uint64_t x) {
@@ -656,14 +657,20 @@ static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq) {
     uint8_t *data_start = buf;
 
     /*
-     * Simple Payload Header: seq(4B) + timestamp(8B) = 12B
-     * Always write full 12 bytes when enabled (both network order)
+     * Simple Payload Header: seq(4B) + timestamp(8B) + pcp(1B) + magic(1B) + reserved(2B) = 16B
+     * PCP is embedded in payload for cases where NIC strips VLAN tags
+     * Magic byte (0xAB) identifies txgen packets for filtering
      */
     if (cfg->add_seq_num && len >= SIMPLE_PAYLOAD_SIZE) {
         uint32_t net_seq = htonl(seq);
         uint64_t net_ts = cfg->add_timestamp ? htonll(get_time_ns()) : 0;
+        uint8_t pcp = (cfg->vlan_count > 0) ? cfg->vlan_prio[0] : 0;
         memcpy(buf, &net_seq, 4);
         memcpy(buf + 4, &net_ts, 8);
+        buf[12] = pcp;           /* PCP value (0-7) */
+        buf[13] = PAYLOAD_MAGIC; /* Magic byte to identify txgen packets */
+        buf[14] = 0;             /* Reserved */
+        buf[15] = 0;             /* Reserved */
         hdr_size = SIMPLE_PAYLOAD_SIZE;
         data_start = buf + hdr_size;
     }
