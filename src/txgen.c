@@ -181,7 +181,7 @@ typedef struct {
     int ip_dst_range;
     uint8_t dscp;
     uint8_t ttl;
-    int ipv6_mode;
+    int ipv6_mode;  /* Reserved: IPv6 TX not implemented (use rxcap for IPv6 RX) */
     int df_flag;  /* Don't Fragment */
 
     /* Layer 4 */
@@ -1928,7 +1928,13 @@ int main(int argc, char *argv[]) {
     /* Initialize */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    memset(g_stats, 0, sizeof(g_stats));
+
+    /* Explicit atomic init (safe for re-run/library use) */
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        atomic_store(&g_stats[i].packets_sent, 0);
+        atomic_store(&g_stats[i].bytes_sent, 0);
+        atomic_store(&g_stats[i].errors, 0);
+    }
 
     /* Multi-TC mode: fork process for each TC */
     if (g_config.multi_tc_count > 1) {
@@ -2042,7 +2048,13 @@ int main(int argc, char *argv[]) {
 
     /* Start RX thread if enabled */
     if (g_config.rx_mode) {
-        memset(&g_rx_stats, 0, sizeof(g_rx_stats));
+        /* Explicit atomic init */
+        atomic_store(&g_rx_stats.packets_recv, 0);
+        atomic_store(&g_rx_stats.bytes_recv, 0);
+        atomic_store(&g_rx_stats.packets_dropped, 0);
+        atomic_store(&g_rx_stats.seq_errors, 0);
+        g_rx_stats.last_seq = 0;
+        fprintf(stderr, "Note: RX mode is approximate; use rxcap for accurate drops/latency\n");
         pthread_create(&g_rx_thread, NULL, rx_thread, &g_config);
     }
 
