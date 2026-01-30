@@ -157,17 +157,17 @@ typedef struct {
     uint32_t last_seq;  /* Last seen sequence */
 
     /* Latency (if timestamp in packet) - uses CLOCK_MONOTONIC_RAW */
-    uint64_t latency_sum;
-    uint64_t latency_count;
-    uint64_t latency_min;
-    uint64_t latency_max;
+    atomic_uint_fast64_t latency_sum;
+    atomic_uint_fast64_t latency_count;
+    atomic_uint_fast64_t latency_min;
+    atomic_uint_fast64_t latency_max;
 
     /* Inter-arrival time */
-    uint64_t last_arrival_ns;
-    uint64_t iat_sum;
-    uint64_t iat_count;
-    uint64_t iat_min;
-    uint64_t iat_max;
+    uint64_t last_arrival_ns;  /* Only written by RX thread */
+    atomic_uint_fast64_t iat_sum;
+    atomic_uint_fast64_t iat_count;
+    atomic_uint_fast64_t iat_min;
+    atomic_uint_fast64_t iat_max;
 } rx_stats_t;
 
 /*============================================================================
@@ -521,26 +521,28 @@ static void *rx_thread(void *arg) {
                 /* Latency measurement (if timestamp present) */
                 if (cfg->measure_latency && pkt.has_timestamp) {
                     uint64_t latency = now_ns - pkt.timestamp;
-                    g_stats.latency_sum += latency;
-                    g_stats.latency_count++;
-                    if (latency < g_stats.latency_min || g_stats.latency_min == 0) {
-                        g_stats.latency_min = latency;
+                    atomic_fetch_add(&g_stats.latency_sum, latency);
+                    atomic_fetch_add(&g_stats.latency_count, 1);
+                    uint64_t cur_min = atomic_load(&g_stats.latency_min);
+                    if (latency < cur_min || cur_min == 0) {
+                        atomic_store(&g_stats.latency_min, latency);
                     }
-                    if (latency > g_stats.latency_max) {
-                        g_stats.latency_max = latency;
+                    if (latency > atomic_load(&g_stats.latency_max)) {
+                        atomic_store(&g_stats.latency_max, latency);
                     }
                 }
 
                 /* Inter-arrival time */
                 if (g_stats.last_arrival_ns > 0) {
                     uint64_t iat = now_ns - g_stats.last_arrival_ns;
-                    g_stats.iat_sum += iat;
-                    g_stats.iat_count++;
-                    if (iat < g_stats.iat_min || g_stats.iat_min == 0) {
-                        g_stats.iat_min = iat;
+                    atomic_fetch_add(&g_stats.iat_sum, iat);
+                    atomic_fetch_add(&g_stats.iat_count, 1);
+                    uint64_t cur_min = atomic_load(&g_stats.iat_min);
+                    if (iat < cur_min || cur_min == 0) {
+                        atomic_store(&g_stats.iat_min, iat);
                     }
-                    if (iat > g_stats.iat_max) {
-                        g_stats.iat_max = iat;
+                    if (iat > atomic_load(&g_stats.iat_max)) {
+                        atomic_store(&g_stats.iat_max, iat);
                     }
                 }
                 g_stats.last_arrival_ns = now_ns;
@@ -654,19 +656,25 @@ static void *stats_thread(void *arg) {
             }
 
             /* Latency: -1 if not measured or no data */
-            if (cfg->measure_latency && g_stats.latency_count > 0) {
-                double lat_avg = (double)g_stats.latency_sum / g_stats.latency_count;
+            uint64_t lat_count = atomic_load(&g_stats.latency_count);
+            if (cfg->measure_latency && lat_count > 0) {
+                uint64_t lat_sum = atomic_load(&g_stats.latency_sum);
+                double lat_avg = (double)lat_sum / lat_count;
                 fprintf(g_csv_fp, ",%lu,%.0f,%lu",
-                        g_stats.latency_min, lat_avg, g_stats.latency_max);
+                        atomic_load(&g_stats.latency_min), lat_avg,
+                        atomic_load(&g_stats.latency_max));
             } else {
                 fprintf(g_csv_fp, ",-1,-1,-1");
             }
 
             /* IAT: -1 if no data */
-            if (g_stats.iat_count > 0) {
-                double iat_avg = (double)g_stats.iat_sum / g_stats.iat_count;
+            uint64_t iat_count = atomic_load(&g_stats.iat_count);
+            if (iat_count > 0) {
+                uint64_t iat_sum = atomic_load(&g_stats.iat_sum);
+                double iat_avg = (double)iat_sum / iat_count;
                 fprintf(g_csv_fp, ",%lu,%.0f,%lu\n",
-                        g_stats.iat_min, iat_avg, g_stats.iat_max);
+                        atomic_load(&g_stats.iat_min), iat_avg,
+                        atomic_load(&g_stats.iat_max));
             } else {
                 fprintf(g_csv_fp, ",-1,-1,-1\n");
             }
@@ -747,24 +755,28 @@ static void *stats_thread(void *arg) {
         }
 
         /* Latency stats */
-        if (cfg->measure_latency && g_stats.latency_count > 0) {
-            double avg_lat = (double)g_stats.latency_sum / g_stats.latency_count / 1000.0;
+        uint64_t lat_cnt = atomic_load(&g_stats.latency_count);
+        if (cfg->measure_latency && lat_cnt > 0) {
+            uint64_t lat_sum = atomic_load(&g_stats.latency_sum);
+            double avg_lat = (double)lat_sum / lat_cnt / 1000.0;
             printf("\n  Latency (us) [CLOCK_MONOTONIC_RAW]:\n");
             if (kernel_drops > 0) {
                 printf("    ⚠ WARNING: drops > 0, latency may be inflated by RX backlog\n");
             }
-            printf("    Min: %.1f\n", g_stats.latency_min / 1000.0);
+            printf("    Min: %.1f\n", atomic_load(&g_stats.latency_min) / 1000.0);
             printf("    Avg: %.1f\n", avg_lat);
-            printf("    Max: %.1f\n", g_stats.latency_max / 1000.0);
+            printf("    Max: %.1f\n", atomic_load(&g_stats.latency_max) / 1000.0);
         }
 
         /* Inter-arrival time */
-        if (g_stats.iat_count > 0) {
-            double avg_iat = (double)g_stats.iat_sum / g_stats.iat_count / 1000.0;
+        uint64_t iat_cnt = atomic_load(&g_stats.iat_count);
+        if (iat_cnt > 0) {
+            uint64_t iat_s = atomic_load(&g_stats.iat_sum);
+            double avg_iat = (double)iat_s / iat_cnt / 1000.0;
             printf("\n  Inter-arrival Time (us):\n");
-            printf("    Min: %.1f\n", g_stats.iat_min / 1000.0);
+            printf("    Min: %.1f\n", atomic_load(&g_stats.iat_min) / 1000.0);
             printf("    Avg: %.1f\n", avg_iat);
-            printf("    Max: %.1f\n", g_stats.iat_max / 1000.0);
+            printf("    Max: %.1f\n", atomic_load(&g_stats.iat_max) / 1000.0);
         }
 
         printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
