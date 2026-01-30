@@ -73,8 +73,9 @@
  * Constants
  *============================================================================*/
 
-#define VERSION "1.7.0"
+#define VERSION "1.8.1"
 #define MAX_PACKET_SIZE 9000
+#define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_PACKET_SIZE 1472
 #define DEFAULT_BATCH_SIZE 512
 #define MAX_WORKERS 64
@@ -286,6 +287,21 @@ static struct timespec g_start_time;
 static token_bucket_t g_bucket;
 static FILE *g_stats_fp = NULL;
 
+/* Thread-local PRNG seed for thread-safe random number generation */
+static __thread unsigned int tls_rand_seed = 0;
+
+/* Thread-safe random number wrapper */
+static inline int tls_rand(void) {
+    return rand_r(&tls_rand_seed);
+}
+
+/* Initialize thread-local seed (call at start of each worker) */
+static inline void tls_rand_init(int worker_id) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    tls_rand_seed = (unsigned int)(ts.tv_nsec ^ (ts.tv_sec << 16) ^ (worker_id * 1000003));
+}
+
 /*============================================================================
  * Signal Handler
  *============================================================================*/
@@ -431,80 +447,87 @@ static uint16_t tcp_udp_checksum(uint32_t saddr, uint32_t daddr,
 
 static void rand_mac(uint8_t *mac) {
     for (int i = 0; i < 6; i++) {
-        mac[i] = rand() & 0xff;
+        mac[i] = tls_rand() & 0xff;
     }
     mac[0] &= 0xfe;
 }
 
 static uint32_t rand_ip_in_range(uint32_t start, uint32_t end) {
     if (start == end) return start;
-    return start + (rand() % (end - start + 1));
+    return start + (tls_rand() % (end - start + 1));
 }
 
 static uint16_t rand_port_in_range(uint16_t start, uint16_t end) {
     if (start == end) return start;
-    return start + (rand() % (end - start + 1));
+    return start + (tls_rand() % (end - start + 1));
 }
 
 /*============================================================================
  * Token Bucket Rate Limiter
  *============================================================================*/
 
-static void token_bucket_init(token_bucket_t *tb, double rate_mbps, int batch_size, int pkt_size) {
+static void token_bucket_init(token_bucket_t *tb, double rate_mbps, double rate_pps,
+                              int batch_size, int pkt_size) {
     pthread_mutex_init(&tb->lock, NULL);
 
-    if (rate_mbps <= 0) {
-        tb->tokens_per_ns = 0;  /* Unlimited */
-        tb->max_tokens = 1e18;
-        tb->tokens = tb->max_tokens;
-    } else {
-        double bytes_per_sec = rate_mbps * 1000000.0 / 8.0;
-        tb->tokens_per_ns = bytes_per_sec / 1e9;
-        tb->max_tokens = (double)batch_size * pkt_size * 2;
-        tb->tokens = tb->max_tokens;
+    double bytes_per_sec = 0;
+    if (rate_pps > 0) {
+        /* PPS mode: packets per second × packet size */
+        bytes_per_sec = rate_pps * pkt_size;
+    } else if (rate_mbps > 0) {
+        /* Mbps mode */
+        bytes_per_sec = rate_mbps * 1000000.0 / 8.0;
     }
 
+    if (bytes_per_sec <= 0) {
+        tb->tokens_per_ns = 0;  /* Unlimited */
+        tb->max_tokens = 1e18;
+    } else {
+        tb->tokens_per_ns = bytes_per_sec / 1e9;
+        tb->max_tokens = (double)batch_size * pkt_size * 2;
+    }
+    tb->tokens = tb->max_tokens;
     clock_gettime(CLOCK_MONOTONIC, &tb->last_update);
 }
 
 static int token_bucket_consume(token_bucket_t *tb, size_t bytes) {
     if (tb->tokens_per_ns <= 0) return 1;  /* Unlimited */
 
-    pthread_mutex_lock(&tb->lock);
+    while (g_running) {
+        pthread_mutex_lock(&tb->lock);
 
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed_ns = (now.tv_sec - tb->last_update.tv_sec) * 1e9 +
+                            (now.tv_nsec - tb->last_update.tv_nsec);
 
-    double elapsed_ns = (now.tv_sec - tb->last_update.tv_sec) * 1e9 +
-                       (now.tv_nsec - tb->last_update.tv_nsec);
+        if (elapsed_ns > 0) {
+            tb->tokens += elapsed_ns * tb->tokens_per_ns;
+            if (tb->tokens > tb->max_tokens) tb->tokens = tb->max_tokens;
+            tb->last_update = now;
+        }
 
-    tb->tokens += elapsed_ns * tb->tokens_per_ns;
-    if (tb->tokens > tb->max_tokens) {
-        tb->tokens = tb->max_tokens;
-    }
-    tb->last_update = now;
+        if (tb->tokens >= (double)bytes) {
+            tb->tokens -= (double)bytes;
+            pthread_mutex_unlock(&tb->lock);
+            return 1;
+        }
 
-    if (tb->tokens >= (double)bytes) {
-        tb->tokens -= (double)bytes;
+        double needed = (double)bytes - tb->tokens;
+        double sleep_ns = needed / tb->tokens_per_ns;
         pthread_mutex_unlock(&tb->lock);
-        return 1;
+
+        if (sleep_ns < 1000) {
+            sched_yield();
+        } else {
+            struct timespec ts = {
+                .tv_sec  = (time_t)(sleep_ns / 1e9),
+                .tv_nsec = (long)((uint64_t)sleep_ns % (uint64_t)1e9)
+            };
+            nanosleep(&ts, NULL);
+        }
     }
-
-    /* Calculate sleep time */
-    double needed = (double)bytes - tb->tokens;
-    double sleep_ns = needed / tb->tokens_per_ns;
-
-    pthread_mutex_unlock(&tb->lock);
-
-    if (sleep_ns > 100) {
-        struct timespec ts = {
-            .tv_sec = (time_t)(sleep_ns / 1e9),
-            .tv_nsec = (long)((uint64_t)sleep_ns % (uint64_t)1e9)
-        };
-        nanosleep(&ts, NULL);
-    }
-
-    return 1;
+    return 0;
 }
 
 /*============================================================================
@@ -546,7 +569,7 @@ static int build_ip_header(uint8_t *buf, config_t *cfg, int payload_len,
     ip->ihl = 5;
     ip->tos = cfg->dscp << 2;
     ip->tot_len = htons(sizeof(struct iphdr) + payload_len);
-    ip->id = htons(rand() & 0xffff);
+    ip->id = htons(tls_rand() & 0xffff);
     ip->frag_off = cfg->df_flag ? htons(0x4000) : 0;
     ip->ttl = cfg->ttl;
     ip->protocol = (cfg->pkt_type == PKT_UDP) ? IPPROTO_UDP :
@@ -563,33 +586,33 @@ static int build_ip_header(uint8_t *buf, config_t *cfg, int payload_len,
     return sizeof(struct iphdr);
 }
 
-static int build_udp_packet(uint8_t *buf, config_t *cfg, int payload_len,
-                            uint16_t sport, uint16_t dport,
-                            uint32_t saddr, uint32_t daddr) {
+static int build_udp_header(uint8_t *buf, int payload_len,
+                            uint16_t sport, uint16_t dport) {
     struct udphdr *udp = (struct udphdr *)buf;
 
     udp->source = htons(sport);
     udp->dest = htons(dport);
     udp->len = htons(sizeof(struct udphdr) + payload_len);
-    udp->check = 0;
-
-    if (cfg->calc_l4_csum) {
-        udp->check = tcp_udp_checksum(saddr, daddr, IPPROTO_UDP,
-                                      udp, sizeof(struct udphdr) + payload_len);
-    }
+    udp->check = 0;  /* Checksum calculated later after payload fill */
 
     return sizeof(struct udphdr);
 }
 
-static int build_tcp_packet(uint8_t *buf, config_t *cfg,
-                            uint16_t sport, uint16_t dport,
-                            uint32_t saddr, uint32_t daddr, uint32_t seq) {
+/* Calculate UDP checksum after payload is filled */
+static void finalize_udp_checksum(uint8_t *udp_start, int total_len,
+                                   uint32_t saddr, uint32_t daddr) {
+    struct udphdr *udp = (struct udphdr *)udp_start;
+    udp->check = tcp_udp_checksum(saddr, daddr, IPPROTO_UDP, udp, total_len);
+}
+
+static int build_tcp_header(uint8_t *buf, config_t *cfg,
+                            uint16_t sport, uint16_t dport, uint32_t tcp_seq) {
     struct tcphdr *tcp = (struct tcphdr *)buf;
 
     memset(tcp, 0, sizeof(struct tcphdr));
     tcp->source = htons(sport);
     tcp->dest = htons(dport);
-    tcp->seq = htonl(seq);
+    tcp->seq = htonl(tcp_seq);
     tcp->ack_seq = htonl(cfg->tcp_ack);
     tcp->doff = 5;
 
@@ -606,15 +629,17 @@ static int build_tcp_packet(uint8_t *buf, config_t *cfg,
     }
 
     tcp->window = htons(cfg->tcp_window ? cfg->tcp_window : 65535);
-    tcp->check = 0;
+    tcp->check = 0;  /* Checksum calculated later after payload fill */
     tcp->urg_ptr = 0;
 
-    if (cfg->calc_l4_csum) {
-        tcp->check = tcp_udp_checksum(saddr, daddr, IPPROTO_TCP,
-                                      tcp, sizeof(struct tcphdr));
-    }
-
     return sizeof(struct tcphdr);
+}
+
+/* Calculate TCP checksum after payload is filled */
+static void finalize_tcp_checksum(uint8_t *tcp_start, int total_len,
+                                   uint32_t saddr, uint32_t daddr) {
+    struct tcphdr *tcp = (struct tcphdr *)tcp_start;
+    tcp->check = tcp_udp_checksum(saddr, daddr, IPPROTO_TCP, tcp, total_len);
 }
 
 static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq, uint8_t worker_id) {
@@ -680,7 +705,7 @@ static void fill_payload(uint8_t *buf, int len, config_t *cfg, uint32_t seq, uin
                 break;
             case PAYLOAD_RANDOM:
                 for (int i = 0; i < data_len; i++) {
-                    data_start[i] = rand() & 0xff;
+                    data_start[i] = tls_rand() & 0xff;
                 }
                 break;
             case PAYLOAD_INCREMENT:
@@ -718,7 +743,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
     /* Random packet size if enabled */
     if (cfg->packet_size_rand && cfg->packet_size_min > 0 && cfg->packet_size_max > 0) {
         pkt_size = cfg->packet_size_min +
-                   (rand() % (cfg->packet_size_max - cfg->packet_size_min + 1));
+                   (tls_rand() % (cfg->packet_size_max - cfg->packet_size_min + 1));
     }
 
     /* Randomize MAC if needed */
@@ -742,7 +767,7 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
         if (cfg->ip_src_range) {
             saddr = htonl(rand_ip_in_range(cfg->src_ip_start, cfg->src_ip_end));
         } else if (cfg->ip_src_rand) {
-            saddr = htonl(rand());
+            saddr = htonl(tls_rand());
         } else {
             saddr = inet_addr(cfg->src_ip);
         }
@@ -777,20 +802,33 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
         int l4_total = l4_hdr_size + payload_len;
         offset += build_ip_header(buf + offset, cfg, l4_total, saddr, daddr);
 
-        /* Transport layer */
+        /* Track L4 header start for checksum calculation */
+        uint8_t *l4_start = buf + offset;
+
+        /* Transport layer (checksum computed later after payload fill) */
         if (cfg->pkt_type == PKT_UDP) {
-            offset += build_udp_packet(buf + offset, cfg, payload_len,
-                                       sport, dport, saddr, daddr);
+            offset += build_udp_header(buf + offset, payload_len, sport, dport);
         } else if (cfg->pkt_type == PKT_TCP) {
-            offset += build_tcp_packet(buf + offset, cfg, sport, dport,
-                                       saddr, daddr, ctx->seq_num++);
+            offset += build_tcp_header(buf + offset, cfg, sport, dport, ctx->seq_num);
         }
 
         /* Payload */
         if (payload_len > 0) {
-            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num++, ctx->id);
+            fill_payload(buf + offset, payload_len, cfg, ctx->seq_num, ctx->id);
             offset += payload_len;
         }
+
+        /* L4 checksum - must be after payload fill to include payload data */
+        if (cfg->calc_l4_csum) {
+            if (cfg->pkt_type == PKT_UDP) {
+                finalize_udp_checksum(l4_start, l4_total, saddr, daddr);
+            } else if (cfg->pkt_type == PKT_TCP) {
+                finalize_tcp_checksum(l4_start, l4_total, saddr, daddr);
+            }
+        }
+
+        /* Increment sequence number once per packet */
+        ctx->seq_num++;
     }
 
     /* Ensure minimum frame size */
@@ -811,6 +849,9 @@ static void *worker_thread(void *arg) {
     worker_ctx_t *ctx = (worker_ctx_t *)arg;
     config_t *cfg = ctx->cfg;
     worker_stats_t *stats = ctx->stats;
+
+    /* Initialize thread-local PRNG seed */
+    tls_rand_init(ctx->id);
 
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
@@ -874,7 +915,7 @@ static void *worker_thread(void *arg) {
     int *pkt_sizes = malloc(batch * sizeof(int));
 
     for (int i = 0; i < batch; i++) {
-        packets[i] = aligned_alloc(64, MAX_PACKET_SIZE);
+        packets[i] = aligned_alloc(64, MAX_PACKET_SIZE_ALIGNED);
         memset(packets[i], 0, MAX_PACKET_SIZE);
     }
 
@@ -1033,22 +1074,64 @@ static void *rx_thread(void *arg) {
             local_packets++;
             local_bytes += len;
 
-            /* Check sequence number if present (first 4 bytes of UDP payload) */
+            /* Check sequence number if present in UDP payload */
             if (cfg->add_seq_num && len >= 46) {
-                /* Skip Eth(14) + IP(20) + UDP(8) = 42, or with VLAN: 46 */
-                uint32_t seq;
                 int offset = 14;  /* Ethernet header */
-                if (buf[12] == 0x81 && buf[13] == 0x00) {
-                    offset += 4;  /* VLAN tag */
-                }
-                offset += 20 + 8;  /* IP + UDP */
-                if (len > offset + 4) {
-                    memcpy(&seq, buf + offset, 4);
-                    seq = ntohl(seq);
-                    if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
-                        atomic_fetch_add(&g_rx_stats.seq_errors, 1);
+
+                /* Skip VLAN tags (single or QinQ) */
+                while (offset + 4 <= len) {
+                    uint16_t ethertype = (buf[offset - 2] << 8) | buf[offset - 1];
+                    if (offset == 14) {
+                        ethertype = (buf[12] << 8) | buf[13];
                     }
-                    g_rx_stats.last_seq = seq;
+                    if (ethertype == 0x8100 || ethertype == 0x88a8) {
+                        offset += 4;
+                    } else {
+                        break;
+                    }
+                }
+
+                /* Check for IPv4 */
+                if (offset + 20 <= len && (buf[offset] >> 4) == 4) {
+                    int ihl = (buf[offset] & 0x0F) * 4;  /* IP header length */
+                    uint8_t proto = buf[offset + 9];
+
+                    if (proto == 17 && offset + ihl + 8 <= len) {  /* UDP */
+                        int payload_start = offset + ihl + 8;
+                        int payload_len = len - payload_start;
+
+                        uint32_t seq = 0;
+                        int found_seq = 0;
+
+                        /* Try new TSN header format first */
+                        if (payload_len >= TSN_PAYLOAD_HDR_SIZE &&
+                            tsn_is_new_format(buf + payload_start, payload_len)) {
+                            const tsn_payload_hdr_t *hdr = (const tsn_payload_hdr_t *)(buf + payload_start);
+                            if (TSN_HDR_HAS_SEQ(hdr)) {
+                                seq = ntohl(hdr->seq_num);
+                                found_seq = 1;
+                            }
+                        }
+                        /* Fall back to legacy format */
+                        else if (payload_len >= 4 && !cfg->legacy_payload) {
+                            /* If using new format but received legacy, skip */
+                        }
+                        else if (payload_len >= 4) {
+                            memcpy(&seq, buf + payload_start, 4);
+                            seq = ntohl(seq);
+                            /* Sanity check: magic would be 0x54534E31 */
+                            if (seq != TSN_PAYLOAD_MAGIC) {
+                                found_seq = 1;
+                            }
+                        }
+
+                        if (found_seq) {
+                            if (g_rx_stats.last_seq != 0 && seq != g_rx_stats.last_seq + 1) {
+                                atomic_fetch_add(&g_rx_stats.seq_errors, 1);
+                            }
+                            g_rx_stats.last_seq = seq;
+                        }
+                    }
                 }
             }
 
@@ -1462,6 +1545,12 @@ static int parse_vlan(const char *str, config_t *cfg) {
 int main(int argc, char *argv[]) {
     /* Default configuration */
     memset(&g_config, 0, sizeof(g_config));
+
+    /* Initialize PRNG for main thread (workers use thread-local seed) */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    srand((unsigned int)(ts.tv_nsec ^ ts.tv_sec));
+
     g_config.eth_type = ETH_P_IP;
     g_config.ttl = 64;
     g_config.src_port = 10000 + (rand() % 50000);
@@ -1898,7 +1987,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.batch_size, g_config.packet_size);
+    token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.rate_pps,
+                      g_config.batch_size, g_config.packet_size);
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
 
     /* Start workers */

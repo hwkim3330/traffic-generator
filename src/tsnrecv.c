@@ -52,6 +52,7 @@
 
 #define VERSION "1.3.0"
 #define MAX_PACKET_SIZE 9000
+#define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_BATCH_SIZE 256
 #define STATS_INTERVAL_US 1000000
 #define MAX_PCP 8
@@ -371,7 +372,7 @@ static void *rx_thread(void *arg) {
     uint8_t **cmsg_bufs = malloc(batch * sizeof(uint8_t *));
 
     for (int i = 0; i < batch; i++) {
-        buffers[i] = aligned_alloc(64, MAX_PACKET_SIZE);
+        buffers[i] = aligned_alloc(64, MAX_PACKET_SIZE_ALIGNED);
         cmsg_bufs[i] = malloc(cmsg_size);
         iovecs[i].iov_base = buffers[i];
         iovecs[i].iov_len = MAX_PACKET_SIZE;

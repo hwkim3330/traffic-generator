@@ -11,7 +11,7 @@
 
 ## 주요 기능
 
-### tsngen (TX) v1.7.0
+### tsngen (TX) v1.8.1
 - **10+ Gbps** 처리량 (sendmmsg 배치 전송)
 - **Multi-TC 모드** - 8개 TC 동시 전송
 - **VLAN PCP/DEI** 지원
@@ -348,6 +348,8 @@ sudo ./tsnrecv eth0 --batch 512 ...
 ## 버전 히스토리
 
 ### tsngen
+- v1.8.1: token_bucket g_running 체크, --pps 옵션 동작 수정
+- v1.8.0: 버그 수정 - L4 체크섬 payload 반영, seq_num 이중 증가 수정, rand() thread-safe 변경
 - v1.7.0: 표준 TSN payload 헤더 (24B), flow_id, --legacy-payload
 - v1.6.0: Multi-TC 시퀀스 충돌 수정 (TC별 offset)
 - v1.5.0: CLOCK_MONOTONIC_RAW, --rate-per-tc 옵션
