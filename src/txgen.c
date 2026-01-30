@@ -273,13 +273,12 @@ typedef struct {
     atomic_uint_fast64_t errors;
 } worker_stats_t;
 
-/* Token bucket for rate limiting */
+/* Token bucket for rate limiting (lock-free, per-worker only) */
 typedef struct {
     double tokens;
     double max_tokens;
     double tokens_per_ns;
     struct timespec last_update;
-    pthread_mutex_t lock;
 } token_bucket_t;
 
 /* Worker context */
@@ -488,8 +487,6 @@ static uint16_t rand_port_in_range(uint16_t start, uint16_t end) {
 
 static void token_bucket_init(token_bucket_t *tb, double rate_mbps, double rate_pps,
                               int batch_size, int pkt_size) {
-    pthread_mutex_init(&tb->lock, NULL);
-
     double bytes_per_sec = 0;
     if (rate_pps > 0) {
         /* PPS mode: packets per second × packet size */
@@ -513,9 +510,8 @@ static void token_bucket_init(token_bucket_t *tb, double rate_mbps, double rate_
 static int token_bucket_consume(token_bucket_t *tb, size_t bytes) {
     if (tb->tokens_per_ns <= 0) return 1;  /* Unlimited */
 
+    /* Lock-free: each worker has its own bucket, no contention */
     while (g_running) {
-        pthread_mutex_lock(&tb->lock);
-
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed_ns = (now.tv_sec - tb->last_update.tv_sec) * 1e9 +
@@ -529,13 +525,11 @@ static int token_bucket_consume(token_bucket_t *tb, size_t bytes) {
 
         if (tb->tokens >= (double)bytes) {
             tb->tokens -= (double)bytes;
-            pthread_mutex_unlock(&tb->lock);
             return 1;
         }
 
         double needed = (double)bytes - tb->tokens;
         double sleep_ns = needed / tb->tokens_per_ns;
-        pthread_mutex_unlock(&tb->lock);
 
         if (sleep_ns < 1000) {
             sched_yield();
@@ -2011,8 +2005,11 @@ int main(int argc, char *argv[]) {
     if (strlen(g_config.replay_file) > 0) {
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
+        /* Use large max_tokens for replay (pcap frames vary in size) */
         token_bucket_init(&g_buckets[0], g_config.rate_mbps, g_config.rate_pps,
                           g_config.batch_size, g_config.packet_size);
+        g_buckets[0].max_tokens = 64.0 * 1024 * 1024;  /* 64MB burst for replay */
+        g_buckets[0].tokens = g_buckets[0].max_tokens;
         return replay_pcap(&g_config);
     }
 
