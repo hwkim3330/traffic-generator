@@ -1,222 +1,209 @@
-# High-Performance Traffic Generator
+# trafgen - High-Performance Traffic Generator
 
-1Gbps 이상의 네트워크 트래픽을 생성할 수 있는 고성능 트래픽 생성기.
+mz (Mausezahn) 기반 고성능 네트워크 트래픽 생성기. 1Gbps 이상의 트래픽 생성 지원.
 
-## Features
+## 설치
 
-- **1Gbps+ 트래픽 생성** - sendmmsg() 배치 전송으로 최대 10Gbps까지 지원
-- **다중 워커** - 멀티스레드/멀티프로세스 아키텍처
-- **VLAN 태깅** - 802.1Q VLAN 지원 (ID + Priority)
-- **QoS 마킹** - DSCP 값 설정
-- **유연한 설정** - CLI 옵션 또는 YAML 설정 파일
-- **실시간 통계** - pps, throughput, 에러 모니터링
+### 1. mz (Mausezahn) 설치
 
-## Requirements
-
-### Ubuntu/Debian
 ```bash
-# mz (Mausezahn) 설치 - wrapper script용
+# Ubuntu/Debian
 sudo apt-get install netsniff-ng
 
-# C 버전 빌드용
-sudo apt-get install build-essential
+# RHEL/CentOS
+sudo yum install netsniff-ng
+
+# Arch Linux
+sudo pacman -S netsniff-ng
 ```
 
-### RHEL/CentOS
+### 2. trafgen 설치
+
 ```bash
-sudo yum install netsniff-ng gcc make
+git clone https://github.com/hwkim3330/traffic-generator.git
+cd traffic-generator
+chmod +x trafgen presets.sh
+
+# 시스템에 설치 (선택)
+sudo cp trafgen /usr/local/bin/
 ```
 
-## Quick Start
+## 사용법
 
-### 1. 빌드 (C 버전)
+### 기본 사용
+
 ```bash
-make
-```
-
-### 2. 실행
-
-#### mz Wrapper (trafgen.sh)
-```bash
-# 최대 속도 트래픽
-sudo ./trafgen.sh -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55
+# 최대 속도 UDP 트래픽
+sudo ./trafgen -i eth0 -d 192.168.1.100 -m 00:11:22:33:44:55
 
 # 1Gbps 트래픽
-sudo ./trafgen.sh -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 1000
+sudo ./trafgen -i eth0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 1000
 
-# 멀티 스트림 (더 높은 처리량)
-sudo ./trafgen.sh -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -w 4 -r 4000
+# 60초간 테스트
+sudo ./trafgen -i eth0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 1000 -t 60
 ```
 
-#### C 버전 (traffic_gen)
-```bash
-# 최대 속도 트래픽
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55
+### 옵션
 
-# 1Gbps, 1024바이트 패킷
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 1000 -l 1024
-
-# 10초 테스트, VLAN 태깅
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -t 10 -v 100 -q 5
-```
-
-## Command Line Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
+| 옵션 | 설명 | 기본값 |
+|------|------|--------|
 | `-i, --interface` | 네트워크 인터페이스 | (필수) |
 | `-d, --dst-ip` | 목적지 IP | (필수) |
 | `-m, --dst-mac` | 목적지 MAC | (필수) |
-| `-s, --src-ip` | 출발지 IP | 인터페이스 IP |
-| `-p, --dst-port` | 목적지 포트 | 5001 |
-| `-P, --src-port` | 출발지 포트 | 10000 |
-| `-l, --length` | 패킷 크기 (bytes) | 1472 |
 | `-r, --rate` | 목표 속도 (Mbps), 0=최대 | 0 |
-| `-t, --duration` | 지속 시간 (초), 0=무한 | 0 |
-| `-w, --workers` | 워커 수 | CPU 코어 수 |
-| `-b, --batch` | 배치 크기 | 1024 |
+| `-t, --duration` | 지속 시간 (초) | 무한 |
+| `-n, --streams` | 병렬 스트림 수 | 1 |
+| `-l, --length` | 패킷 크기 (bytes) | 1472 |
+| `-p, --port` | 목적지 포트 | 5001 |
+| `-T, --proto` | 프로토콜 (udp/tcp/icmp) | udp |
 | `-v, --vlan` | VLAN ID (1-4094) | 없음 |
 | `-q, --vlan-prio` | VLAN Priority (0-7) | 0 |
 | `-D, --dscp` | DSCP 값 (0-63) | 0 |
 
-## Usage Examples
+### 예제
 
-### 기본 UDP 트래픽
-```bash
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55
-```
-
-### 특정 속도로 트래픽 생성
+#### 속도 조절
 ```bash
 # 500 Mbps
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 500
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 500
 
-# 2 Gbps (2000 Mbps)
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 2000 -w 4
+# 2 Gbps (멀티 스트림)
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -r 2000 -n 4
 ```
 
-### 패킷 크기 조절
+#### 패킷 크기
 ```bash
 # 소형 패킷 (64 bytes) - 높은 pps
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -l 64
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -l 64
 
 # 점보 프레임 (9000 bytes)
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -l 9000
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -l 9000
 ```
 
-### VLAN 태깅
+#### VLAN 태깅
 ```bash
 # VLAN 100, Priority 5
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -v 100 -q 5
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -v 100 -q 5
 ```
 
-### QoS DSCP 마킹
+#### QoS (DSCP)
 ```bash
-# DSCP EF (46) for VoIP
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -D 46
+# DSCP EF (46) - VoIP
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -D 46
 
-# DSCP AF41 (34) for Video
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -D 34
+# DSCP AF41 (34) - Video
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -D 34
 ```
 
-### 수신측에서 트래픽 확인
+#### TCP SYN
 ```bash
-# iperf3 서버 (목적지에서)
-iperf3 -s -p 5001
-
-# tcpdump로 확인
-sudo tcpdump -i enp15s0 -n udp port 5001
+# TCP SYN to port 80
+sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -T tcp -p 80
 ```
 
-## Performance Tuning
+## Presets (프리셋)
 
-### 높은 처리량을 위한 설정
+자주 사용하는 패턴을 함수로 제공:
 
-1. **워커 수 증가**
 ```bash
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -w 8
+source presets.sh
+
+# UDP flood
+udp_flood enp11s0 192.168.1.100 00:11:22:33:44:55
+
+# TCP SYN flood to port 80
+tcp_syn_flood enp11s0 192.168.1.100 00:11:22:33:44:55 80
+
+# High pps (small packets)
+small_pkt_flood enp11s0 192.168.1.100 00:11:22:33:44:55
+
+# VLAN traffic
+vlan_traffic enp11s0 192.168.1.100 00:11:22:33:44:55 100 5 1000
+
+# VoIP simulation (DSCP EF)
+voip_traffic enp11s0 192.168.1.100 00:11:22:33:44:55 100
+
+# Multi-stream (4 streams)
+multi_stream enp11s0 192.168.1.100 00:11:22:33:44:55 4
+
+# Bandwidth ramp test
+bandwidth_ramp enp11s0 192.168.1.100 00:11:22:33:44:55 1000 100 5
 ```
 
-2. **큰 패킷 사용** (처리량 최대화)
-```bash
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -l 1472
-```
-
-3. **배치 크기 조절**
-```bash
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -b 2048
-```
-
-4. **시스템 튜닝**
-```bash
-# 소켓 버퍼 증가
-sudo sysctl -w net.core.wmem_max=67108864
-sudo sysctl -w net.core.wmem_default=67108864
-
-# 네트워크 큐 증가
-sudo ethtool -G enp11s0 tx 4096
-```
-
-## Output Example
-
-```
-================================================================================
-Traffic Generator - 4 workers, 1472 byte packets
-================================================================================
-    Time |        Packets |   Rate (pps) |      Throughput |     Errors
---------------------------------------------------------------------------------
-    1.0s |        847,293 |      847,293 |        9.97 Gbps |          0
-    2.0s |      1,694,521 |      847,228 |        9.97 Gbps |          0
-    3.0s |      2,541,803 |      847,282 |        9.97 Gbps |          0
---------------------------------------------------------------------------------
-
-Final Summary:
-  Duration:       3.00 seconds
-  Total Packets:  2,541,803
-  Total Data:     3.564 GB
-  Avg Rate:       847,268 pps
-  Avg Throughput: 9.971 Gbps
-  Errors:         0
-================================================================================
-```
-
-## TSN Testing
-
-TSN (Time-Sensitive Networking) 테스트용 사용 예시:
+## TSN 테스트
 
 ### CBS (Credit-Based Shaper) 테스트
-```bash
-# TC2 트래픽 (PCP 4-7 -> Priority 2)
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -v 100 -q 4 -r 1500
 
-# TC6 트래픽 (PCP 0-3 -> Priority 6)
-sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 -v 100 -q 0 -r 3500
+```bash
+source presets.sh
+
+# TC2 트래픽 (PCP 4, 1.5 Mbps)
+tsn_tc2 enp11s0 192.168.1.100 00:11:22:33:44:55 100
+
+# TC6 트래픽 (PCP 0, 3.5 Mbps)
+tsn_tc6 enp11s0 192.168.1.100 00:11:22:33:44:55 100
 ```
 
 ### TAS (Time-Aware Shaper) 테스트
+
 ```bash
-# 여러 우선순위의 트래픽을 동시에 생성
+# 여러 우선순위 트래픽 동시 생성
 for prio in 0 1 2 3 4 5 6 7; do
-    sudo ./traffic_gen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 \
+    sudo ./trafgen -i enp11s0 -d 192.168.1.100 -m 00:11:22:33:44:55 \
         -v 100 -q $prio -r 100 -P $((10000 + prio * 100)) &
 done
 ```
 
-## Files
+## 수신 측 확인
 
-| File | Description |
-|------|-------------|
-| `traffic_generator.c` | C 기반 고성능 트래픽 생성기 |
-| `trafgen.sh` | mz (Mausezahn) wrapper 스크립트 |
-| `config.yaml` | 설정 파일 예시 |
-| `Makefile` | 빌드 스크립트 |
+```bash
+# iperf3 서버
+iperf3 -s -p 5001
 
-## References
+# tcpdump로 패킷 확인
+sudo tcpdump -i eth0 -n udp port 5001
 
-- [Mausezahn (mz)](https://github.com/uweber/mausezahn) - 참고한 트래픽 생성기
-- [netsniff-ng](http://netsniff-ng.org/) - mz가 포함된 툴킷
-- [Linux sendmmsg()](https://man7.org/linux/man-pages/man2/sendmmsg.2.html) - 배치 패킷 전송
+# 패킷 카운트
+sudo tcpdump -i eth0 -n udp port 5001 -c 100 -q
+```
+
+## 성능 튜닝
+
+### 시스템 설정
+
+```bash
+# 소켓 버퍼 증가
+sudo sysctl -w net.core.wmem_max=67108864
+sudo sysctl -w net.core.wmem_default=67108864
+sudo sysctl -w net.core.rmem_max=67108864
+
+# NIC 링버퍼 증가
+sudo ethtool -G eth0 tx 4096 rx 4096
+```
+
+### 높은 처리량
+
+```bash
+# 멀티 스트림 + 큰 패킷
+sudo ./trafgen -i eth0 -d 192.168.1.100 -m 00:11:22:33:44:55 \
+    -n 4 -l 1472 -r 0
+```
+
+## 파일 구조
+
+```
+traffic-generator/
+├── trafgen          # 메인 트래픽 생성기
+├── presets.sh       # 프리셋 함수
+├── config.yaml      # 설정 파일 예시
+└── README.md
+```
 
 ## License
 
 MIT License
+
+## References
+
+- [mz (Mausezahn)](https://man7.org/linux/man-pages/man8/mausezahn.8.html)
+- [netsniff-ng toolkit](http://netsniff-ng.org/)
