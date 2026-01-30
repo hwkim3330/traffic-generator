@@ -1,4 +1,4 @@
-# TSN Traffic Generator & Receiver
+# TSN Traffic Generator & Capture Tools
 # High-performance tools for TSN (Time-Sensitive Networking) testing
 
 CC = gcc
@@ -9,40 +9,40 @@ SRCDIR = src
 
 # Targets
 TSNGEN = tsngen
-TSNRECV = tsnrecv
+TSNCAP = tsncap
 
 .PHONY: all clean install uninstall debug
 
-all: $(TSNGEN) $(TSNRECV)
+all: $(TSNGEN) $(TSNCAP)
 
 $(TSNGEN): $(SRCDIR)/tsngen.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "Built: $(TSNGEN)"
 
-$(TSNRECV): $(SRCDIR)/tsnrecv.c
+$(TSNCAP): $(SRCDIR)/tsncap.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
-	@echo "Built: $(TSNRECV)"
+	@echo "Built: $(TSNCAP)"
 
 debug: CFLAGS = -g -O0 -Wall -Wextra -pthread -D_GNU_SOURCE -DDEBUG
 debug: all
 
 clean:
-	rm -f $(TSNGEN) $(TSNRECV)
+	rm -f $(TSNGEN) $(TSNCAP)
 
 install: all
 	install -m 755 $(TSNGEN) /usr/local/bin/
-	install -m 755 $(TSNRECV) /usr/local/bin/
+	install -m 755 $(TSNCAP) /usr/local/bin/
 	@echo "Installed to /usr/local/bin/"
 
 uninstall:
 	rm -f /usr/local/bin/$(TSNGEN)
-	rm -f /usr/local/bin/$(TSNRECV)
+	rm -f /usr/local/bin/$(TSNCAP)
 
 # Quick test
 test-gen: $(TSNGEN)
 	@echo "tsngen dry run:"
 	sudo ./$(TSNGEN) lo -B 127.0.0.1 -b ff:ff:ff:ff:ff:ff -S
 
-test-recv: $(TSNRECV)
-	@echo "tsnrecv test (3 sec):"
-	sudo ./$(TSNRECV) lo --duration 3
+test-cap: $(TSNCAP)
+	@echo "tsncap test (3 sec):"
+	sudo ./$(TSNCAP) lo --duration 3

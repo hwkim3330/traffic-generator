@@ -1,15 +1,16 @@
 /*
- * tsnrecv - High-Performance TSN Traffic Receiver v1.3.0
- * Companion tool for tsngen - measures TSN traffic characteristics
+ * tsncap - TSN Traffic Capture & Analysis Tool
+ * Companion tool for tsngen - captures and analyzes TSN traffic
  *
  * Copyright (C) 2025
  *
  * Features:
- * - recvmmsg() batch receive for high-speed capture
+ * - recvmmsg() batch receive for 10Gbps+ capture
+ * - PCAP file output (Wireshark compatible)
  * - Per-PCP/TC statistics for TSN analysis
- * - VLAN tag parsing (PCP, DEI, VID)
- * - Inter-arrival time measurement
- * - Sequence number tracking
+ * - VLAN tag parsing (PCP, DEI, VID, QinQ)
+ * - Latency and inter-arrival time measurement
+ * - Sequence number tracking (per flow_id)
  * - CSV export for analysis
  */
 
@@ -38,6 +39,33 @@
 #include <netpacket/packet.h>
 #include <linux/if_ether.h>
 #include <sched.h>
+
+/*============================================================================
+ * PCAP File Format (no libpcap dependency)
+ *============================================================================*/
+#define PCAP_MAGIC          0xa1b2c3d4
+#define PCAP_VERSION_MAJOR  2
+#define PCAP_VERSION_MINOR  4
+#define PCAP_LINKTYPE_ETH   1
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint16_t version_major;
+    uint16_t version_minor;
+    int32_t  thiszone;
+    uint32_t sigfigs;
+    uint32_t snaplen;
+    uint32_t linktype;
+} pcap_hdr_t;
+
+typedef struct {
+    uint32_t ts_sec;
+    uint32_t ts_usec;
+    uint32_t incl_len;
+    uint32_t orig_len;
+} pcap_pkthdr_t;
+#pragma pack(pop)
 
 /*============================================================================
  * TSN Payload Header (inline)
@@ -83,7 +111,7 @@ static inline int tsn_is_new_format(const void *payload, size_t len) {
  * Constants
  *============================================================================*/
 
-#define VERSION "1.3.2"
+#define VERSION "2.0.0"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_BATCH_SIZE 256
@@ -124,6 +152,7 @@ typedef struct {
 
     /* Output */
     char csv_file[256];
+    char pcap_file[256];
     int verbose;
     int quiet;
     int show_pcp_stats;
@@ -174,6 +203,43 @@ static pthread_t g_rx_thread;
 static pthread_t g_stats_thread;
 static struct timespec g_start_time;
 static FILE *g_csv_fp = NULL;
+static FILE *g_pcap_fp = NULL;
+static pthread_mutex_t g_pcap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Write pcap global header */
+static int pcap_open(const char *filename) {
+    g_pcap_fp = fopen(filename, "wb");
+    if (!g_pcap_fp) return -1;
+
+    pcap_hdr_t hdr = {
+        .magic = PCAP_MAGIC,
+        .version_major = PCAP_VERSION_MAJOR,
+        .version_minor = PCAP_VERSION_MINOR,
+        .thiszone = 0,
+        .sigfigs = 0,
+        .snaplen = 65535,
+        .linktype = PCAP_LINKTYPE_ETH
+    };
+    fwrite(&hdr, sizeof(hdr), 1, g_pcap_fp);
+    return 0;
+}
+
+/* Write packet to pcap file */
+static void pcap_write(const uint8_t *data, int len, uint64_t ts_ns) {
+    if (!g_pcap_fp) return;
+
+    pcap_pkthdr_t pkthdr = {
+        .ts_sec = (uint32_t)(ts_ns / 1000000000ULL),
+        .ts_usec = (uint32_t)((ts_ns % 1000000000ULL) / 1000),
+        .incl_len = len,
+        .orig_len = len
+    };
+
+    pthread_mutex_lock(&g_pcap_lock);
+    fwrite(&pkthdr, sizeof(pkthdr), 1, g_pcap_fp);
+    fwrite(data, len, 1, g_pcap_fp);
+    pthread_mutex_unlock(&g_pcap_lock);
+}
 
 /*============================================================================
  * Signal Handler
@@ -464,6 +530,11 @@ static void *rx_thread(void *arg) {
                 local_packets++;
                 local_bytes += len;
 
+                /* Write to pcap file */
+                if (g_pcap_fp) {
+                    pcap_write(buf, len, now_ns);
+                }
+
                 /* Update PCP stats */
                 if (pkt.has_vlan) {
                     atomic_fetch_add(&g_stats.vlan_packets, 1);
@@ -560,7 +631,7 @@ static void *stats_thread(void *arg) {
     if (!cfg->quiet) {
         printf("\n");
         printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-        printf(" tsnrecv v%s - TSN Traffic Receiver\n", VERSION);
+        printf(" tsncap v%s - TSN Traffic Receiver\n", VERSION);
         printf(" Interface: %s | Batch: %d", cfg->interface, cfg->batch_size);
         if (cfg->filter_vlan) printf(" | VLAN: %d", cfg->vlan_id);
         if (cfg->filter_pcp) printf(" | PCP: %d", cfg->pcp);
@@ -760,7 +831,7 @@ static void *stats_thread(void *arg) {
 
 static void print_usage(const char *prog) {
     printf("\n");
-    printf("tsnrecv v%s - TSN Traffic Receiver\n", VERSION);
+    printf("tsncap v%s - TSN Traffic Receiver\n", VERSION);
     printf("Companion tool for tsngen - measures TSN traffic characteristics\n");
     printf("\n");
     printf("Usage: %s [options] <interface>\n", prog);
@@ -784,6 +855,7 @@ static void print_usage(const char *prog) {
     printf("\n");
     printf("Output:\n");
     printf("  --csv FILE               Write CSV output (standardized schema)\n");
+    printf("  --pcap FILE              Write pcap file (Wireshark compatible)\n");
     printf("  -q, --quiet              Quiet mode\n");
     printf("  -v, --verbose            Verbose output\n");
     printf("  -h, --help               Show help\n");
@@ -836,6 +908,7 @@ int main(int argc, char *argv[]) {
         {"latency",   no_argument,       0, 1006},
         {"pcp-stats", no_argument,       0, 1007},
         {"csv",       required_argument, 0, 1008},
+        {"pcap",      required_argument, 0, 1011},
         {"affinity",  optional_argument, 0, 1009},
         {"tsn-only", no_argument,       0, 1010},
         {"quiet",     no_argument,       0, 'q'},
@@ -848,7 +921,7 @@ int main(int argc, char *argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "qvh", long_options, NULL)) != -1) {
         switch (opt) {
-            case 1000: printf("tsnrecv v%s\n", VERSION); return 0;
+            case 1000: printf("tsncap v%s\n", VERSION); return 0;
             case 1010: g_config.tsn_only = 1; break;
             case 1001:
                 g_config.filter_vlan = 1;
@@ -865,6 +938,9 @@ int main(int argc, char *argv[]) {
             case 1007: g_config.show_pcp_stats = 1; break;
             case 1008:
                 strncpy(g_config.csv_file, optarg, sizeof(g_config.csv_file) - 1);
+                break;
+            case 1011:
+                strncpy(g_config.pcap_file, optarg, sizeof(g_config.pcap_file) - 1);
                 break;
             case 1009:
                 g_config.use_affinity = 1;
@@ -905,6 +981,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Open pcap file */
+    if (strlen(g_config.pcap_file) > 0) {
+        if (pcap_open(g_config.pcap_file) < 0) {
+            fprintf(stderr, "Failed to open pcap file: %s\n", g_config.pcap_file);
+        }
+    }
+
     /* Initialize */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -925,6 +1008,10 @@ int main(int argc, char *argv[]) {
     pthread_join(g_rx_thread, NULL);
 
     if (g_csv_fp) fclose(g_csv_fp);
+    if (g_pcap_fp) {
+        fclose(g_pcap_fp);
+        printf("  Pcap saved: %s\n", g_config.pcap_file);
+    }
 
     return 0;
 }

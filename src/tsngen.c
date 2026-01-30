@@ -51,6 +51,31 @@
 #include <sched.h>
 
 /*============================================================================
+ * PCAP File Format (no libpcap dependency)
+ *============================================================================*/
+#define PCAP_MAGIC          0xa1b2c3d4
+#define PCAP_LINKTYPE_ETH   1
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint16_t version_major;
+    uint16_t version_minor;
+    int32_t  thiszone;
+    uint32_t sigfigs;
+    uint32_t snaplen;
+    uint32_t linktype;
+} pcap_hdr_t;
+
+typedef struct {
+    uint32_t ts_sec;
+    uint32_t ts_usec;
+    uint32_t incl_len;
+    uint32_t orig_len;
+} pcap_pkthdr_t;
+#pragma pack(pop)
+
+/*============================================================================
  * TSN Payload Header (inline)
  *============================================================================*/
 #define TSN_PAYLOAD_VERSION     1
@@ -94,7 +119,7 @@ static inline int tsn_is_new_format(const void *payload, size_t len) {
  * Constants
  *============================================================================*/
 
-#define VERSION "1.8.3"
+#define VERSION "2.0.0"
 #define MAX_PACKET_SIZE 9000
 #define MAX_PACKET_SIZE_ALIGNED ((MAX_PACKET_SIZE + 63) & ~63)  /* 9024, multiple of 64 */
 #define DEFAULT_PACKET_SIZE 1472
@@ -138,6 +163,7 @@ typedef enum {
 /* Global configuration */
 typedef struct {
     char interface[IFNAMSIZ];
+    char replay_file[256];  /* Pcap file for replay mode */
 
     /* Layer 2 */
     uint8_t eth_src[ETH_ALEN];
@@ -1376,6 +1402,9 @@ static void print_usage(const char *prog) {
     printf("  --timestamp              Add timestamp to payload\n");
     printf("  --legacy-payload         Use legacy 12-byte header (default: new 24-byte)\n");
     printf("\n");
+    printf("Replay:\n");
+    printf("  --replay FILE            Replay packets from pcap file\n");
+    printf("\n");
     printf("Checksum:\n");
     printf("  --ip-csum                Calculate IP checksum\n");
     printf("  --l4-csum                Calculate TCP/UDP checksum\n");
@@ -1525,6 +1554,89 @@ static int parse_vlan(const char *str, config_t *cfg) {
 }
 
 /*============================================================================
+ * PCAP Replay Mode
+ *============================================================================*/
+
+static int replay_pcap(config_t *cfg) {
+    FILE *fp = fopen(cfg->replay_file, "rb");
+    if (!fp) {
+        perror("Failed to open pcap file");
+        return -1;
+    }
+
+    /* Read and verify pcap header */
+    pcap_hdr_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, fp) != 1 || hdr.magic != PCAP_MAGIC) {
+        fprintf(stderr, "Invalid pcap file\n");
+        fclose(fp);
+        return -1;
+    }
+
+    /* Open raw socket */
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sock < 0) {
+        perror("socket");
+        fclose(fp);
+        return -1;
+    }
+
+    int ifindex = get_if_index(cfg->interface);
+    struct sockaddr_ll sll = {
+        .sll_family = AF_PACKET,
+        .sll_ifindex = ifindex,
+        .sll_protocol = htons(ETH_P_ALL)
+    };
+
+    printf("Replaying %s on %s...\n", cfg->replay_file, cfg->interface);
+
+    uint8_t buf[MAX_PACKET_SIZE];
+    pcap_pkthdr_t pkthdr;
+    uint64_t packets = 0, bytes = 0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (g_running && fread(&pkthdr, sizeof(pkthdr), 1, fp) == 1) {
+        if (pkthdr.incl_len > MAX_PACKET_SIZE) {
+            fseek(fp, pkthdr.incl_len, SEEK_CUR);
+            continue;
+        }
+
+        if (fread(buf, pkthdr.incl_len, 1, fp) != 1) break;
+
+        ssize_t sent = sendto(sock, buf, pkthdr.incl_len, 0,
+                              (struct sockaddr *)&sll, sizeof(sll));
+        if (sent > 0) {
+            packets++;
+            bytes += sent;
+        }
+
+        /* Rate limiting */
+        if (cfg->rate_mbps > 0) {
+            token_bucket_consume(&g_bucket, pkthdr.incl_len);
+        }
+
+        /* Duration check */
+        if (cfg->duration > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec - start.tv_sec >= cfg->duration) break;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+
+    printf("\nReplay Summary:\n");
+    printf("  Packets: %lu\n", packets);
+    printf("  Bytes:   %.3f MB\n", bytes / 1e6);
+    printf("  Time:    %.2f s\n", elapsed);
+    printf("  Rate:    %.2f Mbps\n", (bytes * 8) / elapsed / 1e6);
+
+    close(sock);
+    fclose(fp);
+    return 0;
+}
+
+/*============================================================================
  * Main
  *============================================================================*/
 
@@ -1591,6 +1703,7 @@ int main(int argc, char *argv[]) {
         {"simulation",    no_argument,       0, 'S'},
         {"help",          no_argument,       0, 'h'},
         {"version",       no_argument,       0, 1000},
+        {"replay",        required_argument, 0, 1027},
         {0, 0, 0, 0}
     };
 
@@ -1760,6 +1873,9 @@ int main(int argc, char *argv[]) {
             case 1024: g_config.calc_l4_csum = 1; break;
             case 1025: g_config.rate_per_tc = 1; break;
             case 1026: g_config.legacy_payload = 1; break;
+            case 1027:
+                strncpy(g_config.replay_file, optarg, sizeof(g_config.replay_file) - 1);
+                break;
             case 'q': g_config.quiet = 1; break;
             case 'v': g_config.verbose = 1; break;
             case 'S': g_config.simulation = 1; break;
@@ -1779,7 +1895,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (strlen(g_config.dst_ip) == 0 && !g_config.ip_dst_range && g_config.pkt_type != PKT_ETH_RAW) {
+    if (strlen(g_config.dst_ip) == 0 && !g_config.ip_dst_range &&
+        g_config.pkt_type != PKT_ETH_RAW && strlen(g_config.replay_file) == 0) {
         fprintf(stderr, "Error: Destination IP required (-B)\n");
         return 1;
     }
@@ -1799,7 +1916,8 @@ int main(int argc, char *argv[]) {
         if (strlen(g_config.src_ip) == 0) strcpy(g_config.src_ip, "192.168.1.1");
     }
 
-    if (!g_config.eth_dst_rand && memcmp(g_config.eth_dst, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+    if (!g_config.eth_dst_rand && memcmp(g_config.eth_dst, "\x00\x00\x00\x00\x00\x00", 6) == 0 &&
+        strlen(g_config.replay_file) == 0) {
         fprintf(stderr, "Error: Destination MAC required (-b)\n");
         return 1;
     }
@@ -1941,6 +2059,15 @@ int main(int argc, char *argv[]) {
             printf("\nAll %d TCs completed.\n", num_tc);
             return 0;
         }
+    }
+
+    /* Replay mode */
+    if (strlen(g_config.replay_file) > 0) {
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+        token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.rate_pps,
+                          g_config.batch_size, g_config.packet_size);
+        return replay_pcap(&g_config);
     }
 
     token_bucket_init(&g_bucket, g_config.rate_mbps, g_config.rate_pps,

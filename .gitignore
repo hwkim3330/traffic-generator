@@ -1,5 +1,6 @@
 # Compiled binaries
 tsngen
+tsncap
 tsnrecv
 *.o
 *.a
