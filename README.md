@@ -7,7 +7,7 @@
 - **의존성 없음**: 표준 C/POSIX만 사용 (libpcap 불필요)
 - **고성능**: sendmmsg/recvmmsg 배치 처리, lock-free token bucket rate limiting
 - **정밀 측정**: per-packet timestamp, atomic 통계, CAS 기반 min/max
-- **프로토콜 지원**: IPv4/IPv6 UDP, VLAN (802.1Q, QinQ, 802.1ad)
+- **프로토콜 지원**: IPv4 UDP, VLAN (802.1Q, QinQ, 802.1ad)
 - **Cleanup-safe**: 모든 에러 경로에서 리소스 누수 없음
 
 ## 도구
@@ -40,6 +40,17 @@ USB Gigabit LAN 어댑터 2개 직결 환경에서 테스트 (2025-01-30):
 - GCC with C11 support
 - Root 권한 (raw socket 사용)
 
+## 라이선스
+
+MIT License
+
+## 같은 머신 측정 체크리스트
+
+- TX/RX를 서로 다른 NIC로 분리
+- 브리지/본딩 사용 금지
+- 오프로딩 비활성화 권장 (TSO/GSO/GRO/LRO)
+- 지연 측정은 같은 머신에서만 정확 (CLOCK_MONOTONIC_RAW)
+
 ## 설치
 
 ```bash
@@ -71,6 +82,17 @@ sudo ./txgen eth0 -B 192.168.1.100 -b 00:11:22:33:44:55 --multi-tc 0-7:100 --seq
 # pcap 캡처 및 재생
 sudo ./rxcap eth1 --pcap capture.pcap --duration 10
 sudo ./txgen eth0 --replay capture.pcap -r 100
+```
+
+## 유틸 스크립트
+
+```bash
+# 오프로딩 끄기/켜기
+./scripts/toggle_offload.sh eth0 off
+./scripts/toggle_offload.sh eth0 on
+
+# 같은 머신 TX/RX 간단 실행
+./scripts/run_same_machine.sh <tx_if> <rx_if> <dst_ip> <dst_mac> [rate_mbps] [duration_sec]
 ```
 
 ## txgen 옵션
@@ -107,7 +129,7 @@ Traffic Control:
 Payload:
   --seq                      시퀀스 번호 삽입 (4 bytes)
   --timestamp                타임스탬프 삽입 (8 bytes)
-  -s, --size SIZE            패킷 크기 (기본: 1472)
+  -l, --length SIZE          패킷 크기 (기본: 1472)
 
 Multi-TC:
   --multi-tc TC_SPEC[:VLAN]  여러 TC 동시 전송 (예: 0-7:100)
@@ -118,6 +140,12 @@ Replay:
 Performance:
   --affinity                 CPU 고정 (워커별 자동 분배)
 ```
+
+## 멀티-TC stats 파일 포맷
+
+- 기본: `--stats-file stats.csv` → 자식별 `stats.csv.tcX` 생성
+- 커스터마이즈: `{tc}` 플레이스홀더 사용  
+  예) `--stats-file stats_tc{tc}.csv` → `stats_tc0.csv`, `stats_tc1.csv` ...
 
 ## rxcap 옵션
 
@@ -150,13 +178,16 @@ Performance:
 
 ## Payload 포맷
 
-txgen `--seq --timestamp` 옵션 사용 시 UDP payload 앞 12바이트:
+txgen `--seq --timestamp` 옵션 사용 시 UDP payload 앞 16바이트:
 
 ```
 Offset  Size  Field
 ------  ----  -----
 0       4     Sequence Number (network byte order)
 4       8     Timestamp in nanoseconds (network byte order)
+12      1     PCP (embedded, for stripped VLAN tags)
+13      1     Magic (0xAB)
+14      2     Reserved
 ```
 
 rxcap `--seq --latency` 옵션으로 분석.
@@ -242,11 +273,3 @@ pcp0_pkts,pcp1_pkts,...,pcp7_pkts,
 latency_min_ns,latency_avg_ns,latency_max_ns,
 iat_min_ns,iat_avg_ns,iat_max_ns
 ```
-
-## 라이선스
-
-Copyright (C) 2025 KETI (Korea Electronics Technology Institute)
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License version 2 as published by the
-Free Software Foundation.
