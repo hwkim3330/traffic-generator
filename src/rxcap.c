@@ -1,11 +1,8 @@
 /*
  * rxcap - High-Performance Traffic Capture & Analysis Tool
  *
- * Copyright (C) 2025 KETI (Korea Electronics Technology Institute)
- *
- * This program is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 as published by the
- * Free Software Foundation.
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2025 KETI (Korea Electronics Technology Institute)
  *
  * Features:
  * - recvmmsg() batch receive for 10Gbps+ capture
@@ -16,7 +13,6 @@
  * - Sequence number tracking for loss detection
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -286,7 +282,7 @@ static int get_if_index(const char *ifname) {
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
 
     if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
         close(fd);
@@ -564,7 +560,12 @@ static void *rx_thread(void *arg) {
 
                 /* Filters */
                 if (cfg->filter_vlan && (!pkt.has_vlan || pkt.vlan_id != cfg->vlan_id)) continue;
-                if (cfg->filter_pcp && (!pkt.has_vlan || pkt.pcp != cfg->pcp)) continue;
+                if (cfg->filter_pcp) {
+                    int match = 0;
+                    if (pkt.has_vlan && pkt.pcp == cfg->pcp) match = 1;
+                    if (pkt.has_embedded_pcp && pkt.embedded_pcp == cfg->pcp) match = 1;
+                    if (!match) continue;
+                }
                 if (cfg->seq_only && !pkt.has_seq) continue;
 
                 local_packets++;
