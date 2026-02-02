@@ -1,11 +1,8 @@
 /*
  * txgen - High-Performance Traffic Generator
  *
- * Copyright (C) 2025 KETI (Korea Electronics Technology Institute)
- *
- * This program is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 as published by the
- * Free Software Foundation.
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2025 KETI (Korea Electronics Technology Institute)
  *
  * Features:
  * - sendmmsg() batch transmission for 10Gbps+ throughput
@@ -15,7 +12,6 @@
  * - PCAP replay capability
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -363,7 +359,7 @@ static int get_if_mac(const char *ifname, uint8_t *mac) {
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
 
     if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
         close(fd);
@@ -381,7 +377,7 @@ static int get_if_index(const char *ifname) {
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
 
     if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
         close(fd);
@@ -398,7 +394,7 @@ static int get_if_ip(const char *ifname, char *ip, size_t len) {
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
     ifr.ifr_addr.sa_family = AF_INET;
 
     if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
@@ -410,6 +406,57 @@ static int get_if_ip(const char *ifname, char *ip, size_t len) {
     inet_ntop(AF_INET, &addr->sin_addr, ip, len);
     close(fd);
     return 0;
+}
+
+static void build_stats_filename(const char *base, char *out, size_t out_len, uint8_t tc) {
+    if (!base || base[0] == '\0') {
+        if (out_len > 0) out[0] = '\0';
+        return;
+    }
+    size_t base_len = strnlen(base, out_len);
+    if (base_len >= out_len) {
+        if (out_len > 0) out[0] = '\0';
+        return;
+    }
+    const char *tag = strstr(base, "{tc}");
+    if (tag) {
+        size_t prefix_len = (size_t)(tag - base);
+        char tc_str[8];
+        int tc_len = snprintf(tc_str, sizeof(tc_str), "%u", tc);
+        if (tc_len < 0) {
+            if (out_len > 0) out[0] = '\0';
+            return;
+        }
+        size_t suffix_len = strnlen(tag + 4, out_len);
+        size_t needed = prefix_len + (size_t)tc_len + suffix_len;
+        if (needed >= out_len) {
+            if (out_len > 0) out[0] = '\0';
+            return;
+        }
+        memcpy(out, base, prefix_len);
+        memcpy(out + prefix_len, tc_str, (size_t)tc_len);
+        memcpy(out + prefix_len + (size_t)tc_len, tag + 4, suffix_len);
+        out[needed] = '\0';
+        return;
+    }
+
+    char suffix[16];
+    int n = snprintf(suffix, sizeof(suffix), ".tc%u", tc);
+    if (n < 0) {
+        if (out_len > 0) out[0] = '\0';
+        return;
+    }
+    size_t needed = base_len + (size_t)n;
+    if (needed >= out_len) {
+        if (out_len > 0) {
+            size_t copy_len = out_len - 1;
+            memcpy(out, base, copy_len);
+            out[copy_len] = '\0';
+        }
+        return;
+    }
+    memcpy(out, base, base_len);
+    memcpy(out + base_len, suffix, (size_t)n + 1);
 }
 
 static uint16_t checksum(void *vdata, size_t length) {
@@ -608,6 +655,22 @@ static int build_udp_header(uint8_t *buf, int payload_len,
     return sizeof(struct udphdr);
 }
 
+static int build_icmp_header(uint8_t *buf, uint16_t seq, uint16_t id) {
+    struct icmphdr *icmp = (struct icmphdr *)buf;
+    memset(icmp, 0, sizeof(*icmp));
+    icmp->type = ICMP_ECHO;
+    icmp->code = 0;
+    icmp->un.echo.id = htons(id);
+    icmp->un.echo.sequence = htons(seq);
+    icmp->checksum = 0;
+    return sizeof(struct icmphdr);
+}
+
+static void finalize_icmp_checksum(uint8_t *icmp_start, int total_len) {
+    struct icmphdr *icmp = (struct icmphdr *)icmp_start;
+    icmp->checksum = checksum(icmp, total_len);
+}
+
 /* Calculate UDP checksum after payload is filled */
 static void finalize_udp_checksum(uint8_t *udp_start, int total_len,
                                    uint32_t saddr, uint32_t daddr) {
@@ -772,7 +835,8 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
         /* Header sizes */
         int ip_hdr_size = sizeof(struct iphdr);
         int l4_hdr_size = (cfg->pkt_type == PKT_UDP) ? sizeof(struct udphdr) :
-                          (cfg->pkt_type == PKT_TCP) ? sizeof(struct tcphdr) : 0;
+                          (cfg->pkt_type == PKT_TCP) ? sizeof(struct tcphdr) :
+                          (cfg->pkt_type == PKT_ICMP) ? sizeof(struct icmphdr) : 0;
         int header_total = offset + ip_hdr_size + l4_hdr_size;
         int payload_len = pkt_size - header_total;
         if (payload_len < 0) payload_len = 0;
@@ -789,6 +853,9 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
             offset += build_udp_header(buf + offset, payload_len, sport, dport);
         } else if (cfg->pkt_type == PKT_TCP) {
             offset += build_tcp_header(buf + offset, cfg, sport, dport, ctx->seq_num);
+        } else if (cfg->pkt_type == PKT_ICMP) {
+            offset += build_icmp_header(buf + offset, (uint16_t)(ctx->seq_num & 0xffff),
+                                        (uint16_t)ctx->id);
         }
 
         /* Payload */
@@ -803,6 +870,8 @@ static int build_packet(uint8_t *buf, config_t *cfg, worker_ctx_t *ctx) {
                 finalize_udp_checksum(l4_start, l4_total, saddr, daddr);
             } else if (cfg->pkt_type == PKT_TCP) {
                 finalize_tcp_checksum(l4_start, l4_total, saddr, daddr);
+            } else if (cfg->pkt_type == PKT_ICMP) {
+                finalize_icmp_checksum(l4_start, l4_total);
             }
         }
 
@@ -1715,7 +1784,10 @@ int main(int argc, char *argv[]) {
                     g_config.pkt_type = PKT_TCP;
                     fprintf(stderr, "Note: TCP mode is stateless (no handshake, for traffic generation only)\n");
                 }
-                else if (strcmp(optarg, "icmp") == 0) g_config.pkt_type = PKT_ICMP;
+                else if (strcmp(optarg, "icmp") == 0) {
+                    g_config.pkt_type = PKT_ICMP;
+                    g_config.calc_l4_csum = 1;
+                }
                 else if (strcmp(optarg, "raw") == 0) g_config.pkt_type = PKT_ETH_RAW;
                 else {
                     fprintf(stderr, "Unknown type: %s\n", optarg);
@@ -1896,14 +1968,6 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /* Open stats file */
-    if (strlen(g_config.stats_file) > 0) {
-        g_stats_fp = fopen(g_config.stats_file, "w");
-        if (g_stats_fp) {
-            fprintf(g_stats_fp, "time,packets,bytes,pps,mbps,errors\n");
-        }
-    }
-
     /* Initialize */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1923,9 +1987,13 @@ int main(int argc, char *argv[]) {
 
         /* Calculate per-TC rate */
         double rate_per_tc_mbps = g_config.rate_mbps;
+        double rate_per_tc_pps = g_config.rate_pps;
         if (g_config.rate_mbps > 0 && !g_config.rate_per_tc) {
             /* If not --rate-per-tc, divide total rate across TCs */
             rate_per_tc_mbps = g_config.rate_mbps / num_tc;
+        }
+        if (g_config.rate_pps > 0 && !g_config.rate_per_tc) {
+            rate_per_tc_pps = g_config.rate_pps / num_tc;
         }
 
         if (!g_config.quiet) {
@@ -1956,6 +2024,7 @@ int main(int argc, char *argv[]) {
 
                 /* Apply calculated rate */
                 g_config.rate_mbps = rate_per_tc_mbps;
+                g_config.rate_pps = rate_per_tc_pps;
 
                 /* Clear multi-TC to prevent recursion */
                 g_config.multi_tc_count = 0;
@@ -1966,6 +2035,16 @@ int main(int argc, char *argv[]) {
 
                 /* Quiet mode for children */
                 g_config.quiet = 1;
+
+                /* Per-TC stats file to avoid concurrent writes */
+                if (strlen(g_config.stats_file) > 0) {
+                    char tc_stats_file[256];
+                    build_stats_filename(g_config.stats_file, tc_stats_file,
+                                         sizeof(tc_stats_file), tc);
+                    strncpy(g_config.stats_file, tc_stats_file,
+                            sizeof(g_config.stats_file) - 1);
+                    g_config.stats_file[sizeof(g_config.stats_file) - 1] = '\0';
+                }
 
                 /* Continue to normal execution */
                 break;
@@ -2006,6 +2085,14 @@ int main(int argc, char *argv[]) {
         }
         g_buckets[0].tokens = g_buckets[0].max_tokens;
         return replay_pcap(&g_config);
+    }
+
+    /* Open stats file */
+    if (strlen(g_config.stats_file) > 0) {
+        g_stats_fp = fopen(g_config.stats_file, "w");
+        if (g_stats_fp) {
+            fprintf(g_stats_fp, "time,packets,bytes,pps,mbps,errors\n");
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &g_start_time);
