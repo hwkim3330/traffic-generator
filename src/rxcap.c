@@ -776,6 +776,13 @@ static void *stats_thread(void *arg) {
         uint64_t delta_packets = total_packets - last_packets;
         uint64_t delta_bytes = total_bytes - last_bytes;
 
+        if (delta_packets == 0) {
+            last_packets = total_packets;
+            last_bytes = total_bytes;
+            last_time = now;
+            continue;
+        }
+
         double pps = delta_packets / interval;
         double mbps = (delta_bytes * 8.0) / (interval * 1e6);
 
