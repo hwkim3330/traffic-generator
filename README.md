@@ -160,6 +160,7 @@ Capture:
 Filter:
   --vlan VID                 VLAN ID 필터
   --pcp PCP                  PCP 필터
+  --dst-mac MAC              목적지 MAC 필터
   --seq-only                 시퀀스 헤더 있는 패킷만
 
 Analysis:
@@ -174,6 +175,12 @@ Output:
 
 Performance:
   --affinity[=CPU]           CPU 고정 (기본: CPU 0)
+```
+
+예시:
+```bash
+# 목적지 MAC 필터로 txgen 패킷만 집계
+sudo ./rxcap eth0 --dst-mac 00:11:22:33:44:55 --seq-only --pcp-stats
 ```
 
 ## Payload 포맷

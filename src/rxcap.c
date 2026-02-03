@@ -134,6 +134,8 @@ typedef struct {
     uint16_t vlan_id;
     int filter_pcp;
     uint8_t pcp;
+    int filter_dst_mac;
+    uint8_t dst_mac[6];
     int seq_only;   /* Only count packets with sequence header */
 
     /* Options */
@@ -415,6 +417,17 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
     return 0;
 }
 
+static int parse_mac_str(const char *s, uint8_t mac[6]) {
+    unsigned int b[6];
+    if (!s) return -1;
+    if (sscanf(s, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return -1;
+    }
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
+    return 0;
+}
+
 /*============================================================================
  * RX Thread (cleanup-safe: all error paths go through cleanup label)
  *============================================================================*/
@@ -559,6 +572,7 @@ static void *rx_thread(void *arg) {
                 if (parse_packet(buf, len, &pkt) < 0) continue;
 
                 /* Filters */
+                if (cfg->filter_dst_mac && memcmp(pkt.dst_mac, cfg->dst_mac, 6) != 0) continue;
                 if (cfg->filter_vlan && (!pkt.has_vlan || pkt.vlan_id != cfg->vlan_id)) continue;
                 if (cfg->filter_pcp) {
                     int match = 0;
@@ -947,6 +961,7 @@ static void print_usage(const char *prog) {
     printf("Filter:\n");
     printf("  --vlan VID               Filter by VLAN ID\n");
     printf("  --pcp NUM                Filter by PCP (0-7)\n");
+    printf("  --dst-mac MAC            Filter by destination MAC\n");
     printf("\n");
     printf("Capture:\n");
     printf("  --duration SEC           Capture duration (0=infinite)\n");
@@ -1020,6 +1035,7 @@ int main(int argc, char *argv[]) {
         {"seq",       no_argument,       0, 1005},
         {"latency",   no_argument,       0, 1006},
         {"pcp-stats", no_argument,       0, 1007},
+        {"dst-mac",   required_argument, 0, 1012},
         {"csv",       required_argument, 0, 1008},
         {"pcap",      required_argument, 0, 1011},
         {"affinity",  optional_argument, 0, 1009},
@@ -1043,6 +1059,11 @@ int main(int argc, char *argv[]) {
             case 1002:
                 g_config.filter_pcp = 1;
                 g_config.pcp = atoi(optarg) & 0x7;
+                break;
+            case 1012:
+                if (parse_mac_str(optarg, g_config.dst_mac) == 0) {
+                    g_config.filter_dst_mac = 1;
+                }
                 break;
             case 1003: g_config.duration = atoi(optarg); break;
             case 1004: g_config.batch_size = atoi(optarg); break;
