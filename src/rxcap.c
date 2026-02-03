@@ -151,6 +151,10 @@ typedef struct {
     int quiet;
     int show_pcp_stats;
 
+    /* Live packet output */
+    char live_file[256];
+    int live_rate_ms;
+
     /* Performance */
     int use_affinity;
     int affinity_cpu;
@@ -202,6 +206,8 @@ static pthread_t g_stats_thread;
 static struct timespec g_start_time;
 static FILE *g_csv_fp = NULL;
 static FILE *g_pcap_fp = NULL;
+static FILE *g_live_fp = NULL;
+static uint64_t g_last_live_ns = 0;
 static pthread_mutex_t g_pcap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Write pcap global header */
@@ -321,6 +327,13 @@ typedef struct {
     int has_timestamp;
     uint8_t embedded_pcp;     /* PCP embedded in payload (for stripped VLAN tags) */
     int has_embedded_pcp;     /* 1 if packet has valid embedded PCP from txgen */
+
+    int has_ip;
+    int has_udp;
+    uint32_t ip_src;
+    uint32_t ip_dst;
+    uint16_t udp_sport;
+    uint16_t udp_dport;
 } parsed_packet_t;
 
 static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
@@ -361,10 +374,18 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
         int ip_offset = offset;
         int ihl = (buf[ip_offset] & 0x0F) * 4;
         uint8_t ip_proto = buf[ip_offset + 9];
+        if (len >= ip_offset + ihl) {
+            memcpy(&pkt->ip_src, buf + ip_offset + 12, 4);
+            memcpy(&pkt->ip_dst, buf + ip_offset + 16, 4);
+            pkt->has_ip = 1;
+        }
 
         if (ip_proto == 17 && len >= ip_offset + ihl + 8) {  /* UDP */
             udp_payload_start = ip_offset + ihl + 8;
             udp_payload_len = len - udp_payload_start;
+            pkt->has_udp = 1;
+            pkt->udp_sport = (buf[ip_offset + ihl] << 8) | buf[ip_offset + ihl + 1];
+            pkt->udp_dport = (buf[ip_offset + ihl + 2] << 8) | buf[ip_offset + ihl + 3];
         }
     } else if (ethertype == 0x86dd && len >= offset + 40 + 8) {
         /* IPv6 (40-byte fixed header) */
@@ -428,6 +449,11 @@ static int parse_mac_str(const char *s, uint8_t mac[6]) {
     }
     for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
     return 0;
+}
+
+static void format_mac(char *out, const uint8_t mac[6]) {
+    sprintf(out, "%02x:%02x:%02x:%02x:%02x:%02x",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 /*============================================================================
@@ -583,6 +609,33 @@ static void *rx_thread(void *arg) {
                     if (!match) continue;
                 }
                 if (cfg->seq_only && !pkt.has_seq) continue;
+
+                if (g_live_fp && cfg->live_rate_ms > 0) {
+                    if (g_last_live_ns == 0 || (now_ns - g_last_live_ns) >= (uint64_t)cfg->live_rate_ms * 1000000ULL) {
+                        double elapsed = (now_ns - ((uint64_t)g_start_time.tv_sec * 1000000000ULL + g_start_time.tv_nsec)) / 1e9;
+                        char srcmac[32], dstmac[32], ipsrc[64] = "", ipdst[64] = "";
+                        format_mac(srcmac, pkt.src_mac);
+                        format_mac(dstmac, pkt.dst_mac);
+                        if (pkt.has_ip) {
+                            struct in_addr src, dst;
+                            memcpy(&src, &pkt.ip_src, 4);
+                            memcpy(&dst, &pkt.ip_dst, 4);
+                            inet_ntop(AF_INET, &src, ipsrc, sizeof(ipsrc));
+                            inet_ntop(AF_INET, &dst, ipdst, sizeof(ipdst));
+                        }
+                        int vlan_id = pkt.has_vlan ? pkt.vlan_id : -1;
+                        int pcp = -1;
+                        if (pkt.has_vlan) pcp = pkt.pcp;
+                        else if (pkt.has_embedded_pcp) pcp = pkt.embedded_pcp;
+                        int sport = pkt.has_udp ? pkt.udp_sport : -1;
+                        int dport = pkt.has_udp ? pkt.udp_dport : -1;
+                        fprintf(g_live_fp, "%.6f,%d,%s,%s,%d,%d,%s,%s,%d,%d\n",
+                                elapsed, len, srcmac, dstmac, vlan_id, pcp,
+                                ipsrc, ipdst, sport, dport);
+                        fflush(g_live_fp);
+                        g_last_live_ns = now_ns;
+                    }
+                }
 
                 local_packets++;
                 local_bytes += len;
@@ -988,6 +1041,8 @@ static void print_usage(const char *prog) {
     printf("  --seq-only               Only count packets with seq header (filter noise)\n");
     printf("  --latency                Measure latency (requires txgen --timestamp)\n");
     printf("  --pcp-stats              Show per-PCP statistics\n");
+    printf("  --live-file FILE         Write live packet list CSV\n");
+    printf("  --live-rate-ms MS        Min interval between live lines (default 100)\n");
     printf("\n");
     printf("Performance:\n");
     printf("  --affinity[=CPU]         Pin RX thread to CPU core (default: 0)\n");
@@ -1043,6 +1098,7 @@ int main(int argc, char *argv[]) {
     /* Default configuration */
     memset(&g_config, 0, sizeof(g_config));
     g_config.batch_size = DEFAULT_BATCH_SIZE;
+    g_config.live_rate_ms = 100;
 
     static struct option long_options[] = {
         {"vlan",      required_argument, 0, 1001},
@@ -1055,6 +1111,8 @@ int main(int argc, char *argv[]) {
         {"dst-mac",   required_argument, 0, 1012},
         {"csv",       required_argument, 0, 1008},
         {"pcap",      required_argument, 0, 1011},
+        {"live-file", required_argument, 0, 1013},
+        {"live-rate-ms", required_argument, 0, 1014},
         {"affinity",  optional_argument, 0, 1009},
         {"seq-only", no_argument,       0, 1010},
         {"quiet",     no_argument,       0, 'q'},
@@ -1087,6 +1145,13 @@ int main(int argc, char *argv[]) {
             case 1005: g_config.check_seq = 1; break;
             case 1006: g_config.measure_latency = 1; break;
             case 1007: g_config.show_pcp_stats = 1; break;
+            case 1013:
+                strncpy(g_config.live_file, optarg, sizeof(g_config.live_file) - 1);
+                break;
+            case 1014:
+                g_config.live_rate_ms = atoi(optarg);
+                if (g_config.live_rate_ms <= 0) g_config.live_rate_ms = 100;
+                break;
             case 1008:
                 strncpy(g_config.csv_file, optarg, sizeof(g_config.csv_file) - 1);
                 break;
@@ -1149,6 +1214,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Open live packet CSV (for UI list) */
+    if (strlen(g_config.live_file) > 0) {
+        g_live_fp = fopen(g_config.live_file, "w");
+        if (!g_live_fp) {
+            fprintf(stderr, "Failed to open live file: %s\n", g_config.live_file);
+        } else {
+            fprintf(g_live_fp, "t,len,src,dst,vlan,pcp,ip.src,ip.dst,sport,dport\n");
+            fflush(g_live_fp);
+        }
+    }
+
     /* Initialize */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1201,6 +1277,7 @@ int main(int argc, char *argv[]) {
         fclose(g_pcap_fp);
         printf("  Pcap saved: %s\n", g_config.pcap_file);
     }
+    if (g_live_fp) fclose(g_live_fp);
 
     return 0;
 }
