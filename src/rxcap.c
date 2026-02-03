@@ -162,6 +162,8 @@ typedef struct {
     atomic_uint_fast64_t total_bytes;
     atomic_uint_fast64_t vlan_packets;
     atomic_uint_fast64_t non_vlan_packets;
+    atomic_uint_fast64_t seq_packets;
+    atomic_uint_fast64_t embedded_pcp_packets;
     pcp_stats_t pcp[MAX_PCP];
 
     /* Kernel/socket drops (from SO_RXQ_OVFL) */
@@ -584,6 +586,8 @@ static void *rx_thread(void *arg) {
 
                 local_packets++;
                 local_bytes += len;
+                if (pkt.has_seq) atomic_fetch_add(&g_stats.seq_packets, 1);
+                if (pkt.has_embedded_pcp) atomic_fetch_add(&g_stats.embedded_pcp_packets, 1);
 
                 if (pcap_entries) {
                     pcap_entries[pcap_count].data = buf;
@@ -800,6 +804,11 @@ static void *stats_thread(void *arg) {
             for (int p = 0; p < MAX_PCP; p++) {
                 fprintf(g_csv_fp, ",%lu", atomic_load(&g_stats.pcp[p].packets));
             }
+            fprintf(g_csv_fp, ",%lu,%lu,%lu,%lu",
+                    atomic_load(&g_stats.vlan_packets),
+                    atomic_load(&g_stats.non_vlan_packets),
+                    atomic_load(&g_stats.seq_packets),
+                    atomic_load(&g_stats.embedded_pcp_packets));
 
             /* Latency: -1 if not measured or no data */
             uint64_t lat_count = atomic_load(&g_stats.latency_count);
@@ -1002,6 +1011,7 @@ static void print_usage(const char *prog) {
     printf("CSV Schema:\n");
     printf("  time_s, total_pkts, total_pps, total_mbps, drops,\n");
     printf("  pcp0_pkts..pcp7_pkts,\n");
+    printf("  vlan_pkts, non_vlan_pkts, seq_pkts, embedded_pcp_pkts,\n");
     printf("  latency_min_ns, latency_avg_ns, latency_max_ns,\n");
     printf("  iat_min_ns, iat_avg_ns, iat_max_ns\n");
     printf("\n");
@@ -1116,6 +1126,7 @@ int main(int argc, char *argv[]) {
             for (int p = 0; p < MAX_PCP; p++) {
                 fprintf(g_csv_fp, ",pcp%d_pkts", p);
             }
+            fprintf(g_csv_fp, ",vlan_pkts,non_vlan_pkts,seq_pkts,embedded_pcp_pkts");
             fprintf(g_csv_fp, ",latency_min_ns,latency_avg_ns,latency_max_ns");
             fprintf(g_csv_fp, ",iat_min_ns,iat_avg_ns,iat_max_ns\n");
             fflush(g_csv_fp);
