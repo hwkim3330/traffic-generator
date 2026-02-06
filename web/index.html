@@ -17,6 +17,10 @@
     button.stop { background: #c92a2a; }
     .kpi { font-size: 20px; font-weight: 700; }
     .muted { color: #667085; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border-bottom: 1px solid #e6e8eb; padding: 6px 8px; text-align: left; }
+    th { background: #f9fafb; position: sticky; top: 0; }
+    .table-wrap { max-height: 300px; overflow: auto; }
     @media (max-width: 900px) {
       .row, .row2 { grid-template-columns: 1fr; }
     }
@@ -37,6 +41,7 @@
         <div class="f"><label>Duration sec</label><input id="duration_sec" type="number" value="10" /></div>
         <div class="f"><label>VLAN</label><input id="vlan" type="number" value="100" /></div>
         <div class="f" style="justify-content:flex-end;">
+          <label><input id="auto_dst" type="checkbox" checked /> RX 기준 목적지 자동 설정</label>
           <div style="display:flex; gap:8px; margin-top:20px;">
             <button id="startBtn">Start</button>
             <button id="stopBtn" class="stop">Stop</button>
@@ -67,6 +72,35 @@
 
     <div class="card">
       <canvas id="chart" height="90"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>테스트 결과</h3>
+      <div id="result" class="muted">아직 결과 없음</div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead><tr><th>PCP</th><th>Packets</th></tr></thead>
+          <tbody id="pcpBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>실시간 패킷 리스트</h3>
+      <div class="row">
+        <div class="f"><label>VLAN Filter</label><input id="pkt_vlan" placeholder="e.g. 100" /></div>
+        <div class="f"><label>PCP Filter</label><input id="pkt_pcp" placeholder="0-7" /></div>
+        <div class="f"><label>IP Filter</label><input id="pkt_ip" placeholder="src/dst contains" /></div>
+        <div class="f"><label>MAC Filter</label><input id="pkt_mac" placeholder="src/dst contains" /></div>
+      </div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead>
+            <tr><th>t</th><th>len</th><th>vlan</th><th>pcp</th><th>src mac</th><th>dst mac</th><th>ip src</th><th>ip dst</th><th>sport</th><th>dport</th></tr>
+          </thead>
+          <tbody id="pktBody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
   <script src="/app.js"></script>

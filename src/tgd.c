@@ -38,6 +38,7 @@ typedef struct {
     char rx_csv[PATH_BUF];
     char tx_log[PATH_BUF];
     char rx_log[PATH_BUF];
+    char live_csv[PATH_BUF];
 } run_state_t;
 
 typedef struct {
@@ -53,6 +54,9 @@ typedef struct {
     double total_pps;
     double total_mbps;
     uint64_t drops;
+    uint64_t pcp_pkts[8];
+    uint64_t vlan_pkts;
+    uint64_t non_vlan_pkts;
     double lat_avg_ns;
     double iat_avg_ns;
     uint64_t seq_missing;
@@ -360,6 +364,16 @@ static int parse_last_metrics(const char *csv_path, metrics_t *m) {
             case 2: m->total_pps = atof(tok); break;
             case 3: m->total_mbps = atof(tok); break;
             case 4: m->drops = strtoull(tok, NULL, 10); break;
+            case 5: m->pcp_pkts[0] = strtoull(tok, NULL, 10); break;
+            case 6: m->pcp_pkts[1] = strtoull(tok, NULL, 10); break;
+            case 7: m->pcp_pkts[2] = strtoull(tok, NULL, 10); break;
+            case 8: m->pcp_pkts[3] = strtoull(tok, NULL, 10); break;
+            case 9: m->pcp_pkts[4] = strtoull(tok, NULL, 10); break;
+            case 10: m->pcp_pkts[5] = strtoull(tok, NULL, 10); break;
+            case 11: m->pcp_pkts[6] = strtoull(tok, NULL, 10); break;
+            case 12: m->pcp_pkts[7] = strtoull(tok, NULL, 10); break;
+            case 13: m->vlan_pkts = strtoull(tok, NULL, 10); break;
+            case 14: m->non_vlan_pkts = strtoull(tok, NULL, 10); break;
             case 18: m->lat_avg_ns = atof(tok); break;
             case 21: m->iat_avg_ns = atof(tok); break;
             case 24: m->seq_missing = strtoull(tok, NULL, 10); break;
@@ -372,6 +386,28 @@ static int parse_last_metrics(const char *csv_path, metrics_t *m) {
     }
     m->valid = (idx >= 29);
     return m->valid ? 0 : -1;
+}
+
+static int parse_live_csv_line(const char *line, char *json, size_t json_sz) {
+    /* schema: t,len,src,dst,vlan,pcp,ip.src,ip.dst,sport,dport */
+    char buf[MED_BUF];
+    snprintf(buf, sizeof(buf), "%s", line);
+    char *cols[10] = {0};
+    int n = 0;
+    char *save = NULL;
+    char *tok = strtok_r(buf, ",\r\n", &save);
+    while (tok && n < 10) {
+        cols[n++] = tok;
+        tok = strtok_r(NULL, ",\r\n", &save);
+    }
+    if (n < 10) return -1;
+    snprintf(json, json_sz,
+        "{\"t\":%s,\"len\":%s,\"src\":\"%s\",\"dst\":\"%s\","
+        "\"vlan\":%s,\"pcp\":%s,\"ip_src\":\"%s\",\"ip_dst\":\"%s\","
+        "\"sport\":%s,\"dport\":%s}",
+        cols[0], cols[1], cols[2], cols[3],
+        cols[4], cols[5], cols[6], cols[7], cols[8], cols[9]);
+    return 0;
 }
 
 static pid_t spawn_to_log(char *const argv[], const char *log_file) {
@@ -453,10 +489,11 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         snprintf(err, err_sz, "failed to create session dir");
         return -1;
     }
-    char rx_csv[PATH_BUF], tx_log[PATH_BUF], rx_log[PATH_BUF];
+    char rx_csv[PATH_BUF], tx_log[PATH_BUF], rx_log[PATH_BUF], live_csv[PATH_BUF];
     if (join_path(rx_csv, sizeof(rx_csv), sdir, "rx.csv") != 0 ||
         join_path(tx_log, sizeof(tx_log), sdir, "tx.log") != 0 ||
-        join_path(rx_log, sizeof(rx_log), sdir, "rx.log") != 0) {
+        join_path(rx_log, sizeof(rx_log), sdir, "rx.log") != 0 ||
+        join_path(live_csv, sizeof(live_csv), sdir, "live.csv") != 0) {
         snprintf(err, err_sz, "session path too long");
         return -1;
     }
@@ -468,6 +505,7 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         (char*)rxcap_path, (char*)rx_if,
         (char*)"--seq", (char*)"--latency", (char*)"--seq-only",
         (char*)"--txgen-only", (char*)"--pcp-stats",
+        (char*)"--live-file", live_csv, (char*)"--live-rate-ms", (char*)"100",
         (char*)"--csv", rx_csv, (char*)"--duration", dur, NULL
     };
     char *tx_argv[] = {
@@ -520,6 +558,7 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
     snprintf(g_state.rx_csv, sizeof(g_state.rx_csv), "%s", rx_csv);
     snprintf(g_state.tx_log, sizeof(g_state.tx_log), "%s", tx_log);
     snprintf(g_state.rx_log, sizeof(g_state.rx_log), "%s", rx_log);
+    snprintf(g_state.live_csv, sizeof(g_state.live_csv), "%s", live_csv);
     pthread_mutex_unlock(&g_state_mu);
     return 0;
 }
@@ -595,7 +634,9 @@ static void api_status(int fd) {
         "{\"ok\":true,\"running\":%s,\"tx_pid\":%d,\"rx_pid\":%d,"
         "\"started_at\":\"%s\",\"session_dir\":\"%s\","
         "\"metrics\":{\"valid\":%s,\"time_s\":%.3f,\"pps\":%.0f,\"mbps\":%.3f,"
-        "\"drops\":%llu,\"lat_avg_ns\":%.0f,\"iat_avg_ns\":%.0f,"
+        "\"drops\":%llu,\"vlan_pkts\":%llu,\"non_vlan_pkts\":%llu,"
+        "\"pcp\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
+        "\"lat_avg_ns\":%.0f,\"iat_avg_ns\":%.0f,"
         "\"seq_missing\":%llu,\"txgen_pkts\":%llu,\"jitter_avg_ns\":%.0f}}",
         st.running ? "true" : "false", (int)st.tx_pid, (int)st.rx_pid,
         started, st.session_dir,
@@ -604,6 +645,16 @@ static void api_status(int fd) {
         has_metrics ? m.total_pps : 0.0,
         has_metrics ? m.total_mbps : 0.0,
         (unsigned long long)(has_metrics ? m.drops : 0ULL),
+        (unsigned long long)(has_metrics ? m.vlan_pkts : 0ULL),
+        (unsigned long long)(has_metrics ? m.non_vlan_pkts : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[0] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[1] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[2] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[3] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[4] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[5] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[6] : 0ULL),
+        (unsigned long long)(has_metrics ? m.pcp_pkts[7] : 0ULL),
         has_metrics ? m.lat_avg_ns : 0.0,
         has_metrics ? m.iat_avg_ns : 0.0,
         (unsigned long long)(has_metrics ? m.seq_missing : 0ULL),
@@ -640,6 +691,10 @@ static void api_stream(int fd) {
         "Access-Control-Allow-Origin: *\r\n\r\n";
     if (send_all(fd, hdr, strlen(hdr)) != 0) return;
 
+    char stream_session[PATH_BUF] = "";
+    FILE *live_fp = NULL;
+    long live_pos = 0;
+
     while (!g_stop) {
         pthread_mutex_lock(&g_state_mu);
         update_child_state_locked();
@@ -647,12 +702,17 @@ static void api_stream(int fd) {
         pthread_mutex_unlock(&g_state_mu);
 
         metrics_t m;
-        int has_metrics = (st.rx_csv[0] && parse_last_metrics(st.rx_csv, &m) == 0);
+        int has_metrics = 0;
+        if (st.running && st.rx_csv[0]) {
+            has_metrics = (parse_last_metrics(st.rx_csv, &m) == 0);
+        }
 
         char msg[MED_BUF];
         int n = snprintf(msg, sizeof(msg),
             "data: {\"running\":%s,\"session\":\"%s\",\"metrics\":{\"valid\":%s,"
             "\"time_s\":%.3f,\"pps\":%.0f,\"mbps\":%.3f,\"drops\":%llu,"
+            "\"vlan_pkts\":%llu,\"non_vlan_pkts\":%llu,"
+            "\"pcp\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu],"
             "\"lat_avg_ns\":%.0f,\"jitter_avg_ns\":%.0f,\"seq_missing\":%llu}}\n\n",
             st.running ? "true" : "false",
             st.session_dir,
@@ -661,12 +721,49 @@ static void api_stream(int fd) {
             has_metrics ? m.total_pps : 0.0,
             has_metrics ? m.total_mbps : 0.0,
             (unsigned long long)(has_metrics ? m.drops : 0ULL),
+            (unsigned long long)(has_metrics ? m.vlan_pkts : 0ULL),
+            (unsigned long long)(has_metrics ? m.non_vlan_pkts : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[0] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[1] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[2] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[3] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[4] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[5] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[6] : 0ULL),
+            (unsigned long long)(has_metrics ? m.pcp_pkts[7] : 0ULL),
             has_metrics ? m.lat_avg_ns : 0.0,
             has_metrics ? m.jitter_avg_ns : 0.0,
             (unsigned long long)(has_metrics ? m.seq_missing : 0ULL));
         if (n <= 0 || send_all(fd, msg, (size_t)n) != 0) break;
+
+        /* Incremental packet stream for UI table */
+        if (st.running && st.live_csv[0]) {
+            if (strcmp(stream_session, st.session_dir) != 0) {
+                if (live_fp) fclose(live_fp);
+                live_fp = fopen(st.live_csv, "r");
+                live_pos = 0;
+                snprintf(stream_session, sizeof(stream_session), "%s", st.session_dir);
+            }
+            if (live_fp) {
+                if (fseek(live_fp, live_pos, SEEK_SET) == 0) {
+                    char line[MED_BUF];
+                    while (fgets(line, sizeof(line), live_fp)) {
+                        if (strncmp(line, "t,", 2) == 0) continue;
+                        char pj[MED_BUF];
+                        if (parse_live_csv_line(line, pj, sizeof(pj)) == 0) {
+                            char ev[MED_BUF + 64];
+                            int en = snprintf(ev, sizeof(ev), "event: packet\ndata: %s\n\n", pj);
+                            if (en > 0 && send_all(fd, ev, (size_t)en) != 0) goto done;
+                        }
+                    }
+                    live_pos = ftell(live_fp);
+                }
+            }
+        }
         sleep(1);
     }
+done:
+    if (live_fp) fclose(live_fp);
 }
 
 static void* client_thread(void *arg) {
