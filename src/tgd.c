@@ -77,6 +77,68 @@ static void now_iso8601(char *out, size_t n) {
     strftime(out, n, "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
+static int read_small_text(const char *path, char *out, size_t out_sz) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    if (!fgets(out, (int)out_sz, fp)) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    size_t l = strlen(out);
+    while (l > 0 && (out[l - 1] == '\n' || out[l - 1] == '\r' || out[l - 1] == ' ' || out[l - 1] == '\t')) {
+        out[--l] = 0;
+    }
+    return 0;
+}
+
+static int iface_is_physical(const char *ifname) {
+    char p[PATH_BUF];
+    snprintf(p, sizeof(p), "/sys/class/net/%s/device", ifname);
+    return access(p, F_OK) == 0 ? 1 : 0;
+}
+
+static int iface_carrier(const char *ifname) {
+    char p[PATH_BUF], b[32];
+    snprintf(p, sizeof(p), "/sys/class/net/%s/carrier", ifname);
+    if (read_small_text(p, b, sizeof(b)) != 0) return -1;
+    return atoi(b);
+}
+
+static int get_iface_ipv4(const char *ifname, char *ip_out, size_t ip_out_sz) {
+    struct ifaddrs *ifaddr = NULL, *ifa = NULL;
+    ip_out[0] = 0;
+    if (getifaddrs(&ifaddr) != 0) return -1;
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (strcmp(ifa->ifa_name, ifname) != 0) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        void *addr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+        inet_ntop(AF_INET, addr, ip_out, (socklen_t)ip_out_sz);
+        freeifaddrs(ifaddr);
+        return 0;
+    }
+    freeifaddrs(ifaddr);
+    return -1;
+}
+
+static int get_iface_mac(const char *ifname, char *mac_out, size_t mac_out_sz) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
+    if (ioctl(s, SIOCGIFHWADDR, &ifr) != 0) {
+        close(s);
+        return -1;
+    }
+    close(s);
+    unsigned char *m = (unsigned char*)ifr.ifr_hwaddr.sa_data;
+    snprintf(mac_out, mac_out_sz, "%02x:%02x:%02x:%02x:%02x:%02x",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+    return 0;
+}
+
 static int ensure_dir(const char *p) {
     struct stat st;
     if (stat(p, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : -1;
@@ -354,9 +416,16 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         snprintf(err, err_sz, "interface not found");
         return -1;
     }
-    if (dst_ip[0] == 0 || dst_mac[0] == 0) {
-        snprintf(err, err_sz, "dst_ip and dst_mac are required");
-        return -1;
+    if (dst_mac[0] == 0) {
+        if (get_iface_mac(rx_if, dst_mac, sizeof(dst_mac)) != 0 || dst_mac[0] == 0) {
+            snprintf(err, err_sz, "dst_mac missing and auto-detect failed");
+            return -1;
+        }
+    }
+    if (dst_ip[0] == 0) {
+        if (get_iface_ipv4(rx_if, dst_ip, sizeof(dst_ip)) != 0 || dst_ip[0] == 0) {
+            snprintf(dst_ip, sizeof(dst_ip), "192.168.10.2");
+        }
     }
 
     if (ensure_dir("sessions") != 0) {
@@ -432,34 +501,34 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
 }
 
 static void api_interfaces(int fd) {
-    struct ifaddrs *ifaddr = NULL, *ifa = NULL;
-    if (getifaddrs(&ifaddr) != 0) {
-        send_json(fd, 500, "{\"ok\":false,\"error\":\"getifaddrs failed\"}");
-        return;
-    }
-
     char json[LARGE_BUF];
     size_t off = 0;
     off += snprintf(json + off, sizeof(json) - off, "{\"ok\":true,\"interfaces\":[");
 
-    int first = 1;
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
-        if (ifa->ifa_addr->sa_family != AF_INET) continue;
-        if (strcmp(ifa->ifa_name, "lo") == 0) continue;
+    struct if_nameindex *ifs = if_nameindex();
+    if (!ifs) {
+        send_json(fd, 500, "{\"ok\":false,\"error\":\"if_nameindex failed\"}");
+        return;
+    }
 
-        char ip[64] = {0};
-        void *addr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
-        inet_ntop(AF_INET, addr, ip, sizeof(ip));
+    int first = 1;
+    for (struct if_nameindex *it = ifs; it && it->if_name; it++) {
+        const char *ifname = it->if_name;
+        if (strcmp(ifname, "lo") == 0) continue;
+        if (!iface_is_physical(ifname)) continue;
+
+        char ip[64] = "";
+        (void)get_iface_ipv4(ifname, ip, sizeof(ip));
 
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         if (s < 0) continue;
         struct ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
-        snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifa->ifa_name);
+        snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
         if (ioctl(s, SIOCGIFFLAGS, &ifr) != 0) { close(s); continue; }
         int up = (ifr.ifr_flags & IFF_UP) ? 1 : 0;
         int running = (ifr.ifr_flags & IFF_RUNNING) ? 1 : 0;
+        int carrier = iface_carrier(ifname);
 
         char mac[32] = "";
         if (ioctl(s, SIOCGIFHWADDR, &ifr) == 0) {
@@ -472,12 +541,11 @@ static void api_interfaces(int fd) {
         if (!first) off += snprintf(json + off, sizeof(json) - off, ",");
         first = 0;
         off += snprintf(json + off, sizeof(json) - off,
-            "{\"name\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"up\":%d,\"running\":%d}",
-            ifa->ifa_name, ip, mac, up, running);
+            "{\"name\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"up\":%d,\"running\":%d,\"carrier\":%d}",
+            ifname, ip, mac, up, running, carrier);
         if (off + 128 >= sizeof(json)) break;
     }
-
-    freeifaddrs(ifaddr);
+    if_freenameindex(ifs);
     off += snprintf(json + off, sizeof(json) - off, "]}");
     send_json(fd, 200, json);
 }

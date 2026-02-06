@@ -48,7 +48,9 @@ async function loadInterfaces() {
     return;
   }
   j.interfaces.forEach((it, idx) => {
-    const label = `${it.name} (${it.ip}, ${it.mac})`;
+    const ip = it.ip || "no-ip";
+    const c = it.carrier === 1 ? "link-up" : "link-down";
+    const label = `${it.name} (${ip}, ${it.mac}, ${c})`;
     const o1 = document.createElement("option");
     o1.value = it.name;
     o1.textContent = label;
