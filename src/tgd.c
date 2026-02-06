@@ -385,6 +385,7 @@ static pid_t spawn_to_log(char *const argv[], const char *log_file) {
             close(fd);
         }
         execvp(argv[0], argv);
+        fprintf(stderr, "execvp failed: %s (%s)\n", argv[0], strerror(errno));
         _exit(127);
     }
     return p;
@@ -393,6 +394,14 @@ static pid_t spawn_to_log(char *const argv[], const char *log_file) {
 static int start_run(const char *txgen_path, const char *rxcap_path, const char *query, char *err, size_t err_sz) {
     if (geteuid() != 0) {
         snprintf(err, err_sz, "root privileges required for raw sockets");
+        return -1;
+    }
+    if (access(txgen_path, X_OK) != 0) {
+        snprintf(err, err_sz, "txgen not executable: %s", txgen_path);
+        return -1;
+    }
+    if (access(rxcap_path, X_OK) != 0) {
+        snprintf(err, err_sz, "rxcap not executable: %s", rxcap_path);
         return -1;
     }
     char tx_if[64] = {0}, rx_if[64] = {0}, dst_ip[64] = {0}, dst_mac[64] = {0};
@@ -479,11 +488,26 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         return -1;
     }
     usleep(250000);
+    int st = 0;
+    pid_t w = waitpid(rxp, &st, WNOHANG);
+    if (w == rxp) {
+        snprintf(err, err_sz, "rxcap exited immediately (check session rx.log)");
+        return -1;
+    }
+
     pid_t txp = spawn_to_log(tx_argv, tx_log);
     if (txp <= 0) {
         kill(rxp, SIGTERM);
         waitpid(rxp, NULL, 0);
         snprintf(err, err_sz, "failed to start txgen");
+        return -1;
+    }
+    usleep(250000);
+    w = waitpid(txp, &st, WNOHANG);
+    if (w == txp) {
+        kill(rxp, SIGTERM);
+        waitpid(rxp, NULL, 0);
+        snprintf(err, err_sz, "txgen exited immediately (check session tx.log)");
         return -1;
     }
 
