@@ -16,6 +16,7 @@
 |------|------|----------|
 | **txgen** | 패킷 생성 (TX) | sendmmsg 배치 전송, Multi-TC, VLAN PCP, pcap 재생 |
 | **rxcap** | 패킷 캡처 (RX) | recvmmsg 배치 수신, 지연/IAT 분석, pcap 저장 |
+| **tgd** | 웹 오케스트레이터 | C HTTP 서버, 인터페이스 자동탐지, txgen/rxcap 동시 제어, 실시간 차트 |
 
 ## 테스트 결과
 
@@ -94,6 +95,28 @@ sudo ./txgen eth0 --replay capture.pcap -r 100
 # 같은 머신 TX/RX 간단 실행
 ./scripts/run_same_machine.sh <tx_if> <rx_if> <dst_ip> <dst_mac> [rate_mbps] [duration_sec]
 ```
+
+## Web Dashboard (tgd)
+
+Python 없이 C 서버 단일 바이너리로 동작:
+
+```bash
+make tgd
+sudo ./tgd --port 8080
+# 브라우저: http://127.0.0.1:8080
+```
+
+주요 API:
+- `GET /api/interfaces`: NIC 자동 감지(name/ip/mac/up/running)
+- `POST /api/start?...`: txgen/rxcap 동시 실행
+- `POST /api/stop`: 실행 중지
+- `GET /api/status`: 현재 상태 + 최근 RX 메트릭
+- `GET /api/stream`: SSE 실시간 스트림
+
+실행 결과 파일:
+- `sessions/run_YYYYmmdd_HHMMSS/rx.csv`
+- `sessions/run_YYYYmmdd_HHMMSS/rx.log`
+- `sessions/run_YYYYmmdd_HHMMSS/tx.log`
 
 ## txgen 옵션
 

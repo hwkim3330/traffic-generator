@@ -1,6 +1,7 @@
 # Compiled binaries
 txgen
 rxcap
+tgd
 *.o
 *.a
 
@@ -21,6 +22,7 @@ venv/
 # Test results
 test_results_*/
 *.log
+sessions/
 
 # OS files
 .DS_Store

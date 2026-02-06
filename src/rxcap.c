@@ -137,6 +137,7 @@ typedef struct {
     int filter_dst_mac;
     uint8_t dst_mac[6];
     int seq_only;   /* Only count packets with sequence header */
+    int txgen_only; /* Only count packets with txgen payload magic */
 
     /* Options */
     int duration;
@@ -176,6 +177,9 @@ typedef struct {
     /* Sequence tracking (atomic for stats_thread safety) */
     atomic_uint_fast64_t seq_errors;
     atomic_uint_fast64_t seq_duplicates;
+    atomic_uint_fast64_t seq_gap_events;
+    atomic_uint_fast64_t seq_missing_packets;
+    atomic_uint_fast64_t seq_max_gap;
     _Atomic(uint32_t) first_seq;
     _Atomic(uint32_t) last_seq;
     _Atomic(int) seq_started;
@@ -185,6 +189,14 @@ typedef struct {
     atomic_uint_fast64_t latency_count;
     atomic_uint_fast64_t latency_min;
     atomic_uint_fast64_t latency_max;
+    atomic_uint_fast64_t latency_jitter_sum;
+    atomic_uint_fast64_t latency_jitter_count;
+    atomic_uint_fast64_t latency_jitter_min;
+    atomic_uint_fast64_t latency_jitter_max;
+    uint64_t last_latency_ns;   /* RX thread only */
+
+    /* txgen-aware packet count (magic matched) */
+    atomic_uint_fast64_t txgen_packets;
 
     /* Inter-arrival time */
     uint64_t last_arrival_ns;  /* Only written by RX thread */
@@ -327,6 +339,7 @@ typedef struct {
     int has_timestamp;
     uint8_t embedded_pcp;     /* PCP embedded in payload (for stripped VLAN tags) */
     int has_embedded_pcp;     /* 1 if packet has valid embedded PCP from txgen */
+    int is_txgen_packet;      /* 1 if payload magic matched */
 
     int has_ip;
     int has_udp;
@@ -406,6 +419,7 @@ static int parse_packet(const uint8_t *buf, int len, parsed_packet_t *pkt) {
 
             /* Verify magic byte to ensure this is a txgen packet */
             if (magic == PAYLOAD_MAGIC) {
+                pkt->is_txgen_packet = 1;
                 /* Sequence number (network order) */
                 memcpy(&pkt->seq_num, buf + udp_payload_start, 4);
                 pkt->seq_num = ntohl(pkt->seq_num);
@@ -609,6 +623,7 @@ static void *rx_thread(void *arg) {
                     if (!match) continue;
                 }
                 if (cfg->seq_only && !pkt.has_seq) continue;
+                if (cfg->txgen_only && !pkt.is_txgen_packet) continue;
 
                 if (g_live_fp && cfg->live_rate_ms > 0) {
                     if (g_last_live_ns == 0 || (now_ns - g_last_live_ns) >= (uint64_t)cfg->live_rate_ms * 1000000ULL) {
@@ -641,6 +656,7 @@ static void *rx_thread(void *arg) {
                 local_bytes += len;
                 if (pkt.has_seq) atomic_fetch_add(&g_stats.seq_packets, 1);
                 if (pkt.has_embedded_pcp) atomic_fetch_add(&g_stats.embedded_pcp_packets, 1);
+                if (pkt.is_txgen_packet) atomic_fetch_add(&g_stats.txgen_packets, 1);
 
                 if (pcap_entries) {
                     pcap_entries[pcap_count].data = buf;
@@ -701,6 +717,15 @@ static void *rx_thread(void *arg) {
                             atomic_fetch_add(&g_stats.seq_duplicates, 1);
                         } else if (pkt.seq_num != last + 1) {
                             atomic_fetch_add(&g_stats.seq_errors, 1);
+                            if (pkt.seq_num > last + 1) {
+                                uint64_t gap = (uint64_t)pkt.seq_num - (uint64_t)last - 1;
+                                atomic_fetch_add(&g_stats.seq_gap_events, 1);
+                                atomic_fetch_add(&g_stats.seq_missing_packets, gap);
+                                uint64_t cur_gap_max = atomic_load(&g_stats.seq_max_gap);
+                                while (gap > cur_gap_max) {
+                                    if (atomic_compare_exchange_weak(&g_stats.seq_max_gap, &cur_gap_max, gap)) break;
+                                }
+                            }
                         }
                         atomic_store(&g_stats.last_seq, pkt.seq_num);
                     }
@@ -721,6 +746,24 @@ static void *rx_thread(void *arg) {
                     while (latency > cur) {
                         if (atomic_compare_exchange_weak(&g_stats.latency_max, &cur, latency)) break;
                     }
+
+                    if (g_stats.last_latency_ns > 0) {
+                        uint64_t jitter = (latency > g_stats.last_latency_ns)
+                                            ? (latency - g_stats.last_latency_ns)
+                                            : (g_stats.last_latency_ns - latency);
+                        atomic_fetch_add(&g_stats.latency_jitter_sum, jitter);
+                        atomic_fetch_add(&g_stats.latency_jitter_count, 1);
+
+                        cur = atomic_load(&g_stats.latency_jitter_min);
+                        while (jitter < cur) {
+                            if (atomic_compare_exchange_weak(&g_stats.latency_jitter_min, &cur, jitter)) break;
+                        }
+                        cur = atomic_load(&g_stats.latency_jitter_max);
+                        while (jitter > cur) {
+                            if (atomic_compare_exchange_weak(&g_stats.latency_jitter_max, &cur, jitter)) break;
+                        }
+                    }
+                    g_stats.last_latency_ns = latency;
                 }
 
                 /* IAT (init: UINT64_MAX, so simple < comparison works) */
@@ -887,11 +930,32 @@ static void *stats_thread(void *arg) {
             if (iat_count > 0) {
                 uint64_t iat_sum = atomic_load(&g_stats.iat_sum);
                 double iat_avg = (double)iat_sum / iat_count;
-                fprintf(g_csv_fp, ",%lu,%.0f,%lu\n",
+                fprintf(g_csv_fp, ",%lu,%.0f,%lu",
                         atomic_load(&g_stats.iat_min), iat_avg,
                         atomic_load(&g_stats.iat_max));
             } else {
-                fprintf(g_csv_fp, ",-1,-1,-1\n");
+                fprintf(g_csv_fp, ",-1,-1,-1");
+            }
+
+            /* Sequence gap / txgen / jitter extensions */
+            uint64_t jit_count = atomic_load(&g_stats.latency_jitter_count);
+            if (jit_count > 0) {
+                uint64_t jit_sum = atomic_load(&g_stats.latency_jitter_sum);
+                double jit_avg = (double)jit_sum / jit_count;
+                fprintf(g_csv_fp, ",%lu,%lu,%lu,%lu,%lu,%.0f,%lu\n",
+                        atomic_load(&g_stats.seq_gap_events),
+                        atomic_load(&g_stats.seq_missing_packets),
+                        atomic_load(&g_stats.seq_max_gap),
+                        atomic_load(&g_stats.txgen_packets),
+                        atomic_load(&g_stats.latency_jitter_min),
+                        jit_avg,
+                        atomic_load(&g_stats.latency_jitter_max));
+            } else {
+                fprintf(g_csv_fp, ",%lu,%lu,%lu,%lu,-1,-1,-1\n",
+                        atomic_load(&g_stats.seq_gap_events),
+                        atomic_load(&g_stats.seq_missing_packets),
+                        atomic_load(&g_stats.seq_max_gap),
+                        atomic_load(&g_stats.txgen_packets));
             }
             fflush(g_csv_fp);
         }
@@ -974,6 +1038,9 @@ static void *stats_thread(void *arg) {
             printf("    Last seq:     %u\n", last);
             printf("    Out-of-order: %lu\n", seq_errors);
             printf("    Duplicates:   %lu\n", seq_dups);
+            printf("    Gap events:   %lu\n", atomic_load(&g_stats.seq_gap_events));
+            printf("    Missing pkts: %lu\n", atomic_load(&g_stats.seq_missing_packets));
+            printf("    Max gap:      %lu\n", atomic_load(&g_stats.seq_max_gap));
 
             /* Loss estimate: only meaningful for single-worker + contiguous seq
              * Skip if kernel_drops > 0 (receiver bottleneck makes estimate meaningless) */
@@ -997,6 +1064,14 @@ static void *stats_thread(void *arg) {
             printf("    Min: %.1f\n", atomic_load(&g_stats.latency_min) / 1000.0);
             printf("    Avg: %.1f\n", avg_lat);
             printf("    Max: %.1f\n", atomic_load(&g_stats.latency_max) / 1000.0);
+
+            uint64_t jit_cnt = atomic_load(&g_stats.latency_jitter_count);
+            if (jit_cnt > 0) {
+                double avg_jit = (double)atomic_load(&g_stats.latency_jitter_sum) / jit_cnt / 1000.0;
+                printf("    Jitter Min: %.1f\n", atomic_load(&g_stats.latency_jitter_min) / 1000.0);
+                printf("    Jitter Avg: %.1f\n", avg_jit);
+                printf("    Jitter Max: %.1f\n", atomic_load(&g_stats.latency_jitter_max) / 1000.0);
+            }
         }
 
         /* Inter-arrival time */
@@ -1009,6 +1084,10 @@ static void *stats_thread(void *arg) {
             printf("    Avg: %.1f\n", avg_iat);
             printf("    Max: %.1f\n", atomic_load(&g_stats.iat_max) / 1000.0);
         }
+
+        uint64_t txgen_pkts = atomic_load(&g_stats.txgen_packets);
+        printf("\n  txgen-marked:   %lu (%.1f%%)\n", txgen_pkts,
+               total_packets > 0 ? 100.0 * txgen_pkts / total_packets : 0);
 
         printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
     }
@@ -1031,6 +1110,7 @@ static void print_usage(const char *prog) {
     printf("  --vlan VID               Filter by VLAN ID\n");
     printf("  --pcp NUM                Filter by PCP (0-7)\n");
     printf("  --dst-mac MAC            Filter by destination MAC\n");
+    printf("  --txgen-only             Only count txgen packets (magic=0xAB)\n");
     printf("\n");
     printf("Capture:\n");
     printf("  --duration SEC           Capture duration (0=infinite)\n");
@@ -1075,7 +1155,9 @@ static void print_usage(const char *prog) {
     printf("  pcp0_pkts..pcp7_pkts,\n");
     printf("  vlan_pkts, non_vlan_pkts, seq_pkts, embedded_pcp_pkts,\n");
     printf("  latency_min_ns, latency_avg_ns, latency_max_ns,\n");
-    printf("  iat_min_ns, iat_avg_ns, iat_max_ns\n");
+    printf("  iat_min_ns, iat_avg_ns, iat_max_ns,\n");
+    printf("  seq_gap_events, seq_missing_pkts, seq_max_gap, txgen_pkts,\n");
+    printf("  jitter_min_ns, jitter_avg_ns, jitter_max_ns\n");
     printf("\n");
     printf("Examples:\n");
     printf("  # Capture all traffic on eth0 for 60 seconds\n");
@@ -1109,6 +1191,7 @@ int main(int argc, char *argv[]) {
         {"latency",   no_argument,       0, 1006},
         {"pcp-stats", no_argument,       0, 1007},
         {"dst-mac",   required_argument, 0, 1012},
+        {"txgen-only", no_argument,      0, 1015},
         {"csv",       required_argument, 0, 1008},
         {"pcap",      required_argument, 0, 1011},
         {"live-file", required_argument, 0, 1013},
@@ -1140,6 +1223,7 @@ int main(int argc, char *argv[]) {
                     g_config.filter_dst_mac = 1;
                 }
                 break;
+            case 1015: g_config.txgen_only = 1; break;
             case 1003: g_config.duration = atoi(optarg); break;
             case 1004: g_config.batch_size = atoi(optarg); break;
             case 1005: g_config.check_seq = 1; break;
@@ -1200,7 +1284,9 @@ int main(int argc, char *argv[]) {
             }
             fprintf(g_csv_fp, ",vlan_pkts,non_vlan_pkts,seq_pkts,embedded_pcp_pkts");
             fprintf(g_csv_fp, ",latency_min_ns,latency_avg_ns,latency_max_ns");
-            fprintf(g_csv_fp, ",iat_min_ns,iat_avg_ns,iat_max_ns\n");
+            fprintf(g_csv_fp, ",iat_min_ns,iat_avg_ns,iat_max_ns");
+            fprintf(g_csv_fp, ",seq_gap_events,seq_missing_pkts,seq_max_gap,txgen_pkts");
+            fprintf(g_csv_fp, ",jitter_min_ns,jitter_avg_ns,jitter_max_ns\n");
             fflush(g_csv_fp);
         }
     }
@@ -1237,6 +1323,9 @@ int main(int argc, char *argv[]) {
     atomic_store(&g_stats.kernel_drops, 0);
     atomic_store(&g_stats.seq_errors, 0);
     atomic_store(&g_stats.seq_duplicates, 0);
+    atomic_store(&g_stats.seq_gap_events, 0);
+    atomic_store(&g_stats.seq_missing_packets, 0);
+    atomic_store(&g_stats.seq_max_gap, 0);
     atomic_store(&g_stats.seq_started, 0);
     atomic_store(&g_stats.first_seq, 0);
     atomic_store(&g_stats.last_seq, 0);
@@ -1244,6 +1333,12 @@ int main(int argc, char *argv[]) {
     atomic_store(&g_stats.latency_count, 0);
     atomic_store(&g_stats.latency_min, UINT64_MAX);  /* Use MAX for proper min tracking */
     atomic_store(&g_stats.latency_max, 0);
+    atomic_store(&g_stats.latency_jitter_sum, 0);
+    atomic_store(&g_stats.latency_jitter_count, 0);
+    atomic_store(&g_stats.latency_jitter_min, UINT64_MAX);
+    atomic_store(&g_stats.latency_jitter_max, 0);
+    g_stats.last_latency_ns = 0;
+    atomic_store(&g_stats.txgen_packets, 0);
     atomic_store(&g_stats.iat_sum, 0);
     atomic_store(&g_stats.iat_count, 0);
     atomic_store(&g_stats.iat_min, UINT64_MAX);  /* Use MAX for proper min tracking */

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tgd - Traffic Generator Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: "Noto Sans KR", sans-serif; margin: 0; background: #f3f6f9; color: #111; }
+    .wrap { max-width: 1200px; margin: 20px auto; padding: 0 16px; }
+    .card { background: #fff; border-radius: 10px; padding: 14px; box-shadow: 0 2px 8px rgba(0,0,0,.08); margin-bottom: 14px; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .f { display: flex; flex-direction: column; gap: 6px; }
+    input, select, button { padding: 8px 10px; border: 1px solid #ccd3da; border-radius: 8px; font-size: 14px; }
+    button { background: #0d6efd; color: #fff; border: 0; cursor: pointer; }
+    button.stop { background: #c92a2a; }
+    .kpi { font-size: 20px; font-weight: 700; }
+    .muted { color: #667085; font-size: 12px; }
+    @media (max-width: 900px) {
+      .row, .row2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>tgd Dashboard</h2>
+      <div class="row">
+        <div class="f"><label>TX IF</label><select id="tx_if"></select></div>
+        <div class="f"><label>RX IF</label><select id="rx_if"></select></div>
+        <div class="f"><label>Destination IP</label><input id="dst_ip" value="192.168.10.2" /></div>
+        <div class="f"><label>Destination MAC</label><input id="dst_mac" value="00:11:22:33:44:55" /></div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div class="f"><label>Rate Mbps (per TC)</label><input id="rate_mbps" type="number" value="100" /></div>
+        <div class="f"><label>Duration sec</label><input id="duration_sec" type="number" value="10" /></div>
+        <div class="f"><label>VLAN</label><input id="vlan" type="number" value="100" /></div>
+        <div class="f" style="justify-content:flex-end;">
+          <div style="display:flex; gap:8px; margin-top:20px;">
+            <button id="startBtn">Start</button>
+            <button id="stopBtn" class="stop">Stop</button>
+          </div>
+        </div>
+      </div>
+      <div id="status" class="muted" style="margin-top:10px;">status: idle</div>
+    </div>
+
+    <div class="row2">
+      <div class="card">
+        <div class="muted">Throughput</div>
+        <div class="kpi" id="k_mbps">0 Mbps</div>
+      </div>
+      <div class="card">
+        <div class="muted">Packets/s</div>
+        <div class="kpi" id="k_pps">0 pps</div>
+      </div>
+      <div class="card">
+        <div class="muted">Latency Avg</div>
+        <div class="kpi" id="k_lat">0 us</div>
+      </div>
+      <div class="card">
+        <div class="muted">Jitter Avg</div>
+        <div class="kpi" id="k_jit">0 us</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <canvas id="chart" height="90"></canvas>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
