@@ -39,6 +39,7 @@ typedef struct {
     char tx_log[PATH_BUF];
     char rx_log[PATH_BUF];
     char live_csv[PATH_BUF];
+    int configured_vlan;
 } run_state_t;
 
 typedef struct {
@@ -398,7 +399,7 @@ static int parse_last_metrics(const char *csv_path, metrics_t *m) {
     return m->valid ? 0 : -1;
 }
 
-static int parse_live_csv_line(const char *line, char *json, size_t json_sz) {
+static int parse_live_csv_line(const char *line, int configured_vlan, char *json, size_t json_sz) {
     /* schema: t,len,src,dst,vlan,pcp,ip.src,ip.dst,sport,dport */
     char buf[MED_BUF];
     snprintf(buf, sizeof(buf), "%s", line);
@@ -411,12 +412,18 @@ static int parse_live_csv_line(const char *line, char *json, size_t json_sz) {
         tok = strtok_r(NULL, ",\r\n", &save);
     }
     if (n < 10) return -1;
+    long vlan = strtol(cols[4], NULL, 10);
+    int vlan_derived = 0;
+    if (vlan < 0 && configured_vlan > 0) {
+        vlan = configured_vlan;
+        vlan_derived = 1;
+    }
     snprintf(json, json_sz,
         "{\"t\":%s,\"len\":%s,\"src\":\"%s\",\"dst\":\"%s\","
-        "\"vlan\":%s,\"pcp\":%s,\"ip_src\":\"%s\",\"ip_dst\":\"%s\","
+        "\"vlan\":%ld,\"vlan_derived\":%d,\"pcp\":%s,\"ip_src\":\"%s\",\"ip_dst\":\"%s\","
         "\"sport\":%s,\"dport\":%s}",
         cols[0], cols[1], cols[2], cols[3],
-        cols[4], cols[5], cols[6], cols[7], cols[8], cols[9]);
+        vlan, vlan_derived, cols[5], cols[6], cols[7], cols[8], cols[9]);
     return 0;
 }
 
@@ -597,6 +604,7 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
     snprintf(g_state.tx_log, sizeof(g_state.tx_log), "%s", tx_log);
     snprintf(g_state.rx_log, sizeof(g_state.rx_log), "%s", rx_log);
     snprintf(g_state.live_csv, sizeof(g_state.live_csv), "%s", live_csv);
+    g_state.configured_vlan = atoi(vlan);
     pthread_mutex_unlock(&g_state_mu);
     return 0;
 }
@@ -788,7 +796,7 @@ static void api_stream(int fd) {
                     while (fgets(line, sizeof(line), live_fp)) {
                         if (strncmp(line, "t,", 2) == 0) continue;
                         char pj[MED_BUF];
-                        if (parse_live_csv_line(line, pj, sizeof(pj)) == 0) {
+                        if (parse_live_csv_line(line, st.configured_vlan, pj, sizeof(pj)) == 0) {
                             char ev[MED_BUF + 64];
                             int en = snprintf(ev, sizeof(ev), "event: packet\ndata: %s\n\n", pj);
                             if (en > 0 && send_all(fd, ev, (size_t)en) != 0) goto done;

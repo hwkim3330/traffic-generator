@@ -49,6 +49,19 @@
       </div>
       <div class="row" style="margin-top:10px;">
         <div class="f"><label>TC Spec</label><input id="tc_spec" value="0-7" placeholder="multi: 0-7,0,2,4 / single: 3" /></div>
+        <div class="f">
+          <label>TC Checkboxes</label>
+          <div id="tc_checks" style="display:flex; gap:8px; flex-wrap:wrap;">
+            <label><input type="checkbox" class="tc_chk" value="0" checked />0</label>
+            <label><input type="checkbox" class="tc_chk" value="1" checked />1</label>
+            <label><input type="checkbox" class="tc_chk" value="2" checked />2</label>
+            <label><input type="checkbox" class="tc_chk" value="3" checked />3</label>
+            <label><input type="checkbox" class="tc_chk" value="4" checked />4</label>
+            <label><input type="checkbox" class="tc_chk" value="5" checked />5</label>
+            <label><input type="checkbox" class="tc_chk" value="6" checked />6</label>
+            <label><input type="checkbox" class="tc_chk" value="7" checked />7</label>
+          </div>
+        </div>
         <div class="f" style="justify-content:flex-end;">
           <label><input id="auto_dst" type="checkbox" checked /> RX 기준 목적지 자동 설정</label>
           <div style="display:flex; gap:8px; margin-top:20px;">
@@ -96,6 +109,7 @@
 
     <div class="card">
       <h3>실시간 패킷 리스트</h3>
+      <div class="muted">기본은 RX 기준 캡처 리스트입니다. (지연/드롭 판단 정확도 우선)</div>
       <div class="row">
         <div class="f"><label>VLAN Filter</label><input id="pkt_vlan" placeholder="e.g. 100" /></div>
         <div class="f"><label>PCP Filter</label><input id="pkt_pcp" placeholder="0-7" /></div>

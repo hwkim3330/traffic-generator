@@ -30,6 +30,7 @@ const chart = new Chart($("chart"), {
 
 let prevPcp = null;
 let prevTs = null;
+let lastSession = "";
 function pushPointPcp(m) {
   const pcp = m.pcp || [0,0,0,0,0,0,0,0];
   const t = Number(m.time_s || 0);
@@ -91,6 +92,15 @@ function renderResult(m) {
   }
 }
 
+function selectedTcSpec() {
+  const vals = [...document.querySelectorAll(".tc_chk:checked")]
+    .map((el) => Number(el.value))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 7)
+    .sort((a, b) => a - b);
+  if (vals.length === 0) return "";
+  return vals.join(",");
+}
+
 function packetPassFilter(p) {
   const vf = $("pkt_vlan").value.trim();
   const pf = $("pkt_pcp").value.trim();
@@ -112,7 +122,7 @@ function renderPacketTable() {
     if (filtered.length >= 120) break;
   }
   body.innerHTML = filtered.map((p) =>
-    `<tr><td>${p.t}</td><td>${p.len}</td><td>${p.vlan}</td><td>${p.pcp}</td><td>${p.src}</td><td>${p.dst}</td><td>${p.ip_src}</td><td>${p.ip_dst}</td><td>${p.sport}</td><td>${p.dport}</td></tr>`
+    `<tr><td>${p.t}</td><td>${p.len}</td><td>${p.vlan}${p.vlan_derived ? "*" : ""}</td><td>${p.pcp}</td><td>${p.src}</td><td>${p.dst}</td><td>${p.ip_src}</td><td>${p.ip_dst}</td><td>${p.sport}</td><td>${p.dport}</td></tr>`
   ).join("");
 }
 
@@ -207,6 +217,16 @@ async function startRun() {
     }
   }
 
+  const tcSpecFromChecks = selectedTcSpec();
+  if (!tcSpecFromChecks) {
+    setStatus("start failed: at least one TC must be selected");
+    return;
+  }
+  $("tc_spec").value = tcSpecFromChecks;
+  if ($("tc_mode").value === "single" && tcSpecFromChecks.includes(",")) {
+    setStatus("single mode: first selected TC only");
+  }
+
   const q = new URLSearchParams({
     tx_if: txif,
     rx_if: rxif,
@@ -216,7 +236,7 @@ async function startRun() {
     duration_sec: $("duration_sec").value.trim(),
     vlan: $("vlan").value.trim(),
     tc_mode: $("tc_mode").value,
-    tc_spec: $("tc_spec").value.trim(),
+    tc_spec: $("tc_mode").value === "single" ? tcSpecFromChecks.split(",")[0] : tcSpecFromChecks,
   });
   const r = await fetch(`/api/start?${q.toString()}`, { method: "POST" });
   const j = await r.json();
@@ -240,6 +260,21 @@ function bindButtons() {
   ["pkt_vlan", "pkt_pcp", "pkt_ip", "pkt_mac"].forEach((id) => {
     $(id).addEventListener("input", () => renderPacketTable());
   });
+  document.querySelectorAll(".tc_chk").forEach((el) => {
+    el.addEventListener("change", () => {
+      const spec = selectedTcSpec();
+      if (spec) $("tc_spec").value = spec;
+    });
+  });
+  $("tc_mode").addEventListener("change", () => {
+    if ($("tc_mode").value === "single") {
+      const first = selectedTcSpec().split(",")[0] || "0";
+      $("tc_spec").value = first;
+    } else {
+      const spec = selectedTcSpec();
+      if (spec) $("tc_spec").value = spec;
+    }
+  });
 }
 
 function startStream() {
@@ -247,13 +282,17 @@ function startStream() {
   es.onmessage = (ev) => {
     const d = JSON.parse(ev.data);
     const m = d.metrics || {};
+    lastSession = d.session || "";
     if (!d.running) {
       $("k_mbps").textContent = "0 Mbps";
       $("k_pps").textContent = "0 pps";
       $("k_lat").textContent = "0 us";
       $("k_jit").textContent = "0 us";
       setStatus(`running=false session=${d.session || "-"}`);
-      renderResult(m.valid ? m : null);
+      // 종료 시 최종 결과를 status API에서 1회 가져와 고정 표시
+      fetch("/api/status").then((r) => r.json()).then((sj) => {
+        if (sj && sj.metrics && sj.metrics.valid) renderResult(sj.metrics);
+      }).catch(() => {});
       return;
     }
     $("k_mbps").textContent = `${(m.mbps || 0).toFixed(2)} Mbps`;
