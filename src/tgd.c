@@ -171,6 +171,16 @@ static bool is_safe_path_component(const char *s) {
     return true;
 }
 
+static int is_valid_tc_spec(const char *s) {
+    if (!s || !*s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (!((*p >= '0' && *p <= '9') || *p == ',' || *p == '-' || *p == ':')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void url_decode(char *dst, size_t dst_sz, const char *src) {
     size_t di = 0;
     for (size_t i = 0; src[i] && di + 1 < dst_sz; i++) {
@@ -441,6 +451,7 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         return -1;
     }
     char tx_if[64] = {0}, rx_if[64] = {0}, dst_ip[64] = {0}, dst_mac[64] = {0};
+    char tc_mode[16] = "multi", tc_spec[64] = "0-7";
     char rate[32] = "100", dur[32] = "10", vlan[32] = "100";
     (void)q_get(query, "tx_if", tx_if, sizeof(tx_if));
     (void)q_get(query, "rx_if", rx_if, sizeof(rx_if));
@@ -449,6 +460,8 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
     (void)q_get(query, "rate_mbps", rate, sizeof(rate));
     (void)q_get(query, "duration_sec", dur, sizeof(dur));
     (void)q_get(query, "vlan", vlan, sizeof(vlan));
+    (void)q_get(query, "tc_mode", tc_mode, sizeof(tc_mode));
+    (void)q_get(query, "tc_spec", tc_spec, sizeof(tc_spec));
     if (!is_safe_path_component(tx_if) || !is_safe_path_component(rx_if)) {
         snprintf(err, err_sz, "invalid interface");
         return -1;
@@ -472,6 +485,11 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
             snprintf(dst_ip, sizeof(dst_ip), "192.168.10.2");
         }
     }
+    if (!is_valid_tc_spec(tc_spec)) {
+        snprintf(err, err_sz, "invalid tc_spec");
+        return -1;
+    }
+    int single_mode = (strcmp(tc_mode, "single") == 0);
 
     if (ensure_dir("sessions") != 0) {
         snprintf(err, err_sz, "failed to create sessions dir");
@@ -499,7 +517,20 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
     }
 
     char multi_tc_vlan[64];
-    snprintf(multi_tc_vlan, sizeof(multi_tc_vlan), "0-7:%s", vlan);
+    if (strchr(tc_spec, ':')) snprintf(multi_tc_vlan, sizeof(multi_tc_vlan), "%s", tc_spec);
+    else snprintf(multi_tc_vlan, sizeof(multi_tc_vlan), "%s:%s", tc_spec, vlan);
+    char single_vlan[32];
+    const char *tc_base = tc_spec;
+    char *colon = strchr(tc_spec, ':');
+    if (colon) {
+        size_t n = (size_t)(colon - tc_spec);
+        if (n >= sizeof(single_vlan)) n = sizeof(single_vlan) - 1;
+        memcpy(single_vlan, tc_spec, n);
+        single_vlan[n] = 0;
+        tc_base = single_vlan;
+    }
+    char pcp_vlan[64];
+    snprintf(pcp_vlan, sizeof(pcp_vlan), "%s:%s", tc_base, vlan);
 
     char *rx_argv[] = {
         (char*)rxcap_path, (char*)rx_if,
@@ -508,11 +539,18 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         (char*)"--live-file", live_csv, (char*)"--live-rate-ms", (char*)"100",
         (char*)"--csv", rx_csv, (char*)"--duration", dur, NULL
     };
-    char *tx_argv[] = {
+    char *tx_argv_multi[] = {
         (char*)txgen_path, (char*)tx_if,
         (char*)"-B", (char*)dst_ip, (char*)"-b", (char*)dst_mac,
         (char*)"--seq", (char*)"--timestamp",
         (char*)"--multi-tc", multi_tc_vlan, (char*)"--rate-per-tc",
+        (char*)"-r", (char*)rate, (char*)"--duration", (char*)dur, NULL
+    };
+    char *tx_argv_single[] = {
+        (char*)txgen_path, (char*)tx_if,
+        (char*)"-B", (char*)dst_ip, (char*)"-b", (char*)dst_mac,
+        (char*)"--seq", (char*)"--timestamp",
+        (char*)"-Q", pcp_vlan,
         (char*)"-r", (char*)rate, (char*)"--duration", (char*)dur, NULL
     };
 
@@ -533,7 +571,7 @@ static int start_run(const char *txgen_path, const char *rxcap_path, const char 
         return -1;
     }
 
-    pid_t txp = spawn_to_log(tx_argv, tx_log);
+    pid_t txp = spawn_to_log(single_mode ? tx_argv_single : tx_argv_multi, tx_log);
     if (txp <= 0) {
         kill(rxp, SIGTERM);
         waitpid(rxp, NULL, 0);

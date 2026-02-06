@@ -40,6 +40,15 @@
         <div class="f"><label>Rate Mbps (per TC)</label><input id="rate_mbps" type="number" value="100" /></div>
         <div class="f"><label>Duration sec</label><input id="duration_sec" type="number" value="10" /></div>
         <div class="f"><label>VLAN</label><input id="vlan" type="number" value="100" /></div>
+        <div class="f"><label>TC Mode</label>
+          <select id="tc_mode">
+            <option value="multi">multi (권장)</option>
+            <option value="single">single</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div class="f"><label>TC Spec</label><input id="tc_spec" value="0-7" placeholder="multi: 0-7,0,2,4 / single: 3" /></div>
         <div class="f" style="justify-content:flex-end;">
           <label><input id="auto_dst" type="checkbox" checked /> RX 기준 목적지 자동 설정</label>
           <div style="display:flex; gap:8px; margin-top:20px;">

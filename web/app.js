@@ -11,9 +11,14 @@ const chart = new Chart($("chart"), {
   data: {
     labels: [],
     datasets: [
-      { label: "Mbps", data: [], borderColor: "#0d6efd", tension: 0.15 },
-      { label: "Latency(us)", data: [], borderColor: "#f08c00", tension: 0.15 },
-      { label: "Jitter(us)", data: [], borderColor: "#c92a2a", tension: 0.15 },
+      { label: "TC0 pps", data: [], borderColor: "#1f77b4", tension: 0.12 },
+      { label: "TC1 pps", data: [], borderColor: "#ff7f0e", tension: 0.12 },
+      { label: "TC2 pps", data: [], borderColor: "#2ca02c", tension: 0.12 },
+      { label: "TC3 pps", data: [], borderColor: "#d62728", tension: 0.12 },
+      { label: "TC4 pps", data: [], borderColor: "#9467bd", tension: 0.12 },
+      { label: "TC5 pps", data: [], borderColor: "#8c564b", tension: 0.12 },
+      { label: "TC6 pps", data: [], borderColor: "#e377c2", tension: 0.12 },
+      { label: "TC7 pps", data: [], borderColor: "#17becf", tension: 0.12 },
     ],
   },
   options: {
@@ -23,12 +28,25 @@ const chart = new Chart($("chart"), {
   },
 });
 
-function pushPoint(mbps, latUs, jitUs) {
+let prevPcp = null;
+let prevTs = null;
+function pushPointPcp(m) {
+  const pcp = m.pcp || [0,0,0,0,0,0,0,0];
+  const t = Number(m.time_s || 0);
+  const dt = (prevTs != null && t > prevTs) ? (t - prevTs) : 1;
+  const deltas = pcp.map((v, i) => {
+    if (!prevPcp) return 0;
+    const d = Number(v || 0) - Number(prevPcp[i] || 0);
+    return d > 0 ? d / dt : 0;
+  });
+  prevPcp = pcp.slice();
+  prevTs = t;
+
   points += 1;
   chart.data.labels.push(String(points));
-  chart.data.datasets[0].data.push(mbps);
-  chart.data.datasets[1].data.push(latUs);
-  chart.data.datasets[2].data.push(jitUs);
+  for (let i = 0; i < 8; i++) {
+    chart.data.datasets[i].data.push(deltas[i] || 0);
+  }
   if (chart.data.labels.length > maxPoints) {
     chart.data.labels.shift();
     chart.data.datasets.forEach((d) => d.data.shift());
@@ -38,6 +56,8 @@ function pushPoint(mbps, latUs, jitUs) {
 
 function resetView() {
   points = 0;
+  prevPcp = null;
+  prevTs = null;
   chart.data.labels = [];
   chart.data.datasets.forEach((d) => { d.data = []; });
   chart.update();
@@ -195,6 +215,8 @@ async function startRun() {
     rate_mbps: $("rate_mbps").value.trim(),
     duration_sec: $("duration_sec").value.trim(),
     vlan: $("vlan").value.trim(),
+    tc_mode: $("tc_mode").value,
+    tc_spec: $("tc_spec").value.trim(),
   });
   const r = await fetch(`/api/start?${q.toString()}`, { method: "POST" });
   const j = await r.json();
@@ -240,7 +262,7 @@ function startStream() {
     $("k_jit").textContent = `${((m.jitter_avg_ns || 0) / 1000).toFixed(1)} us`;
     setStatus(`running=${d.running} session=${d.session || "-"}`);
     renderResult(m);
-    if (m.valid) pushPoint(m.mbps || 0, (m.lat_avg_ns || 0) / 1000, (m.jitter_avg_ns || 0) / 1000);
+    if (m.valid) pushPointPcp(m);
   };
   es.addEventListener("packet", (ev) => {
     try {
